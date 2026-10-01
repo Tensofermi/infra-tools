@@ -228,15 +228,10 @@ print_header() {
 print_table() {
   local ids id json name image status health state age owner_pair owner cpu mem mem_pct
   local name_w image_w width status_color cpu_c mem_c hidden=0
-  local -A CPU MEM MEM_PCT
-  while IFS='|' read -r id cpu mem mem_pct; do
-    [[ -n "$id" ]] || continue
-    CPU["$id"]="$cpu"
-    mem="${mem%% / *}"
-    mem="${mem//KiB/K}"; mem="${mem//MiB/M}"; mem="${mem//GiB/G}"; mem="${mem//TiB/T}"
-    MEM["$id"]="$mem"
-    MEM_PCT["$id"]="$mem_pct"
-  done < <(docker stats --no-stream --format '{{.ID}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}' 2>/dev/null || true)
+  # Keep stats as a plain table looked up per id; associative arrays would
+  # need bash 4+, but macOS ships bash 3.2.
+  local stats stats_line
+  stats="$(docker stats --no-stream --format '{{.ID}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}' 2>/dev/null || true)"
 
   if ((SHOW_ALL)); then ids="$(docker ps -aq)"; else ids="$(docker ps -q)"; fi
   printf '\n%s%sCONTAINERS%s%s\n' "$C_BOLD" "$C_CYAN" "$([[ $SHOW_ALL -eq 1 ]] && printf ' (ALL)' || true)" "$C_RESET"
@@ -262,7 +257,14 @@ print_table() {
     health="$(jq -r '.[0].State.Health.Status // empty' <<<"$json")"
     age="$(docker ps -a --filter "id=$id" --format '{{.RunningFor}}' | head -n1 | compact_age)"
     owner_pair="$(infer_owner "$json")"; owner="${owner_pair%%|*}"
-    cpu="${CPU[$id]:--}"; mem="${MEM[$id]:--}"; mem_pct="${MEM_PCT[$id]:--}"
+    stats_line="$(printf '%s\n' "$stats" | awk -F'|' -v id="$id" '$1 == id {print; exit}')"
+    if [[ -n "$stats_line" ]]; then
+      IFS='|' read -r _ cpu mem mem_pct <<<"$stats_line"
+      mem="${mem%% / *}"
+      mem="${mem//KiB/K}"; mem="${mem//MiB/M}"; mem="${mem//GiB/G}"; mem="${mem//TiB/T}"
+    else
+      cpu="-"; mem="-"; mem_pct="-"
+    fi
     case "$status/$health" in
       running/healthy) state='healthy'; status_color="$C_GREEN" ;;
       running/unhealthy) state='unhealthy'; status_color="$C_RED" ;;

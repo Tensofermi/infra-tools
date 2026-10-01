@@ -200,7 +200,13 @@ expand_cpu_list() {
   done
 }
 
-declare -A PREV_TOTAL PREV_IDLE CPU_UTIL
+# Associative arrays need bash 4+, only guaranteed on Linux. The macOS
+# fallback (system bash 3.2) tracks overall CPU in a plain scalar instead.
+if has_procfs; then
+  declare -A PREV_TOTAL PREV_IDLE CPU_UTIL
+else
+  OVERALL_CPU_UTIL=0
+fi
 
 read_initial_snapshot() {
   local label user nice system idle iowait irq softirq steal rest total idle_all
@@ -245,7 +251,7 @@ sample_cpu() {
   if has_procfs; then
     read_cpu_sample
   else
-    CPU_UTIL[cpu]="$(overall_cpu_percent)"
+    OVERALL_CPU_UTIL="$(overall_cpu_percent)"
   fi
 }
 
@@ -352,7 +358,11 @@ render_dashboard() {
   host="$(host_short)"
   uptime_text="$(uptime_pretty)"
   read -r load1 load5 load15 <<<"$(loadavg_values)"
-  util="${CPU_UTIL[cpu]:-0}"
+  if has_procfs; then
+    util="${CPU_UTIL[cpu]:-0}"
+  else
+    util="${OVERALL_CPU_UTIL:-0}"
+  fi
   load_ratio="$(awk -v l="$load1" -v c="$logical_cpus" 'BEGIN{if(c>0)printf "%.0f",100*l/c; else print 0}')"
   if ((util >= 90 || load_ratio >= 100)); then
     status="SATURATED"; status_color="$C_RED"

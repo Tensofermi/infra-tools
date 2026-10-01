@@ -38,8 +38,8 @@ uptime_pretty() {
   fi
   if is_macos; then
     local boot now up
-    boot="$(sysctl -n kern.boottime 2>/dev/null | sed -E 's/.*sec = ([0-9]+).*/\1/')"
-    if [[ -n "$boot" ]]; then
+    boot="$(sysctl -n kern.boottime 2>/dev/null | sed -E 's/^\{ sec = ([0-9]+).*/\1/')"
+    if [[ "$boot" =~ ^[0-9]+$ ]]; then
       now="$(date +%s)"
       up=$((now - boot))
       printf '%d days %02d:%02d' $((up / 86400)) $(((up % 86400) / 3600)) $(((up % 3600) / 60))
