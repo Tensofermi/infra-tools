@@ -1,5 +1,7 @@
 # infra-tools
 
+**English** | [简体中文](README.zh-CN.md)
+
 Terminal dashboards and one-shot installers for shared Linux / GPU servers.
 
 Everything is plain Bash with a tiny dependency footprint, so it works the
