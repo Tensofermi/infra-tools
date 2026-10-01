@@ -1,11 +1,14 @@
 # infra-tools
 
+<p align="center">
+  <a href="./README.md">English</a> |
+  <b>简体中文</b>
+</p>
+
 面向共享 Linux / GPU 服务器的终端看板与一键安装脚本。
 
 全部使用纯 Bash，依赖极少，SSH 登上一台新机器即可使用。安装器会自动识别发行版
 与包管理器；看板在不支持的平台上会有清晰的降级提示，而不是直接崩溃。
-
-[English](README.md) | **简体中文**
 
 ## 仓库结构
 

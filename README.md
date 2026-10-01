@@ -1,6 +1,9 @@
 # infra-tools
 
-**English** | [简体中文](README.zh-CN.md)
+<p align="center">
+  <b>English</b> |
+  <a href="./README.zh-CN.md">简体中文</a>
+</p>
 
 Terminal dashboards and one-shot installers for shared Linux / GPU servers.
 
