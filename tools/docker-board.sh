@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 
 # Human-readable Docker dashboard for shared Linux servers.
 # The host user who ran `docker run` is not recorded by Docker; OWNER is inferred.
 set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/platform.sh
+source "${SCRIPT_DIR}/lib/platform.sh"
 
 PROGRAM_NAME="${0##*/}"
 SHOW_ALL=0
@@ -116,7 +121,7 @@ shorten() {
 }
 
 human_bytes() {
-  numfmt --to=iec-i --suffix=B "${1:-0}" 2>/dev/null || printf '%s B' "${1:-0}"
+  human_bytes_iec "${1:-0}"
 }
 
 owner_from_path() {
@@ -124,15 +129,15 @@ owner_from_path() {
   case "$path" in
     /home/*/*|/home/*)
       candidate="${path#/home/}"; candidate="${candidate%%/*}"
-      getent passwd "$candidate" >/dev/null 2>&1 && { printf '%s|path:%s' "$candidate" "$path"; return; }
+      user_exists "$candidate" && { printf '%s|path:%s' "$candidate" "$path"; return; }
       ;;
     /mnt/nvme/*/*|/mnt/nvme/*)
       candidate="${path#/mnt/nvme/}"; candidate="${candidate%%/*}"
-      getent passwd "$candidate" >/dev/null 2>&1 && { printf '%s|path:%s' "$candidate" "$path"; return; }
+      user_exists "$candidate" && { printf '%s|path:%s' "$candidate" "$path"; return; }
       ;;
   esac
   if [[ -e "$path" ]]; then
-    owner="$(stat -c %U "$path" 2>/dev/null || true)"
+    owner="$(file_owner "$path" || true)"
     [[ -n "$owner" && "$owner" != "root" ]] && { printf '%s|owner:%s' "$owner" "$path"; return; }
   fi
   return 1

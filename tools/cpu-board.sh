@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 
 # Compact terminal dashboard for large multi-socket Linux CPU servers.
+# Works on any Linux distro; on macOS it degrades to overall CPU (no NUMA).
 # No jq/python/root dependency required.
 set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/platform.sh
+source "${SCRIPT_DIR}/lib/platform.sh"
 
 PROGRAM_NAME="${0##*/}"
 WATCH_INTERVAL=""
@@ -33,8 +39,9 @@ Examples:
   NO_COLOR=1 ${PROGRAM_NAME} --ascii
 
 Notes:
-  CPU values are sampled from /proc/stat. In the process table, 100% CPU
-  means one logical CPU; a multi-threaded process can exceed 100%.
+  CPU values are sampled from /proc/stat (Linux). In the process table, 100%
+  CPU means one logical CPU; a multi-threaded process can exceed 100%.
+  On macOS CPU comes from top and the NUMA/per-core heat map is unavailable.
 EOF
 }
 
@@ -92,7 +99,9 @@ is_positive_number "$SAMPLE_INTERVAL" || die "sample interval must be positive"
 if [[ -n "$WATCH_INTERVAL" ]]; then
   is_positive_number "$WATCH_INTERVAL" || die "refresh interval must be positive"
 fi
-[[ -r /proc/stat ]] || die "Linux /proc/stat is not readable"
+if ! has_procfs && ! is_macos; then
+  die "cpu-board supports Linux (/proc) and macOS only (detected: ${PLATFORM})"
+fi
 
 if [[ "$COLOR_MODE" == "auto" && -t 1 && "${TERM:-dumb}" != "dumb" && -z "${NO_COLOR:-}" ]]; then
   C_RESET=$'\033[0m'
@@ -226,6 +235,20 @@ read_cpu_sample() {
   done </proc/stat
 }
 
+init_cpu_sample() {
+  if has_procfs; then
+    read_initial_snapshot
+  fi
+}
+
+sample_cpu() {
+  if has_procfs; then
+    read_cpu_sample
+  else
+    CPU_UTIL[cpu]="$(overall_cpu_percent)"
+  fi
+}
+
 heat_char() {
   local value="${1:-0}" idx color
   idx=$((value / 13))
@@ -234,12 +257,9 @@ heat_char() {
   printf '%s%s%s' "$color" "${HEAT_CHARS[$idx]}" "$C_RESET"
 }
 
-logical_cpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null || awk '/^processor/{n++} END{print n+0}' /proc/cpuinfo)"
-sockets="$(awk -F: '/physical id/{gsub(/ /,"",$2); seen[$2]=1} END{for(i in seen)n++; print n+0}' /proc/cpuinfo)"
-physical_cores="$(awk -F: '
-  /physical id/{gsub(/ /,"",$2); socket=$2}
-  /core id/{gsub(/ /,"",$2); seen[socket ":" $2]=1}
-  END{for(i in seen)n++; print n+0}' /proc/cpuinfo)"
+logical_cpus="$(logical_cpus)"
+sockets="$(sockets)"
+physical_cores="$(physical_cores)"
 ((sockets > 0)) || sockets="?"
 ((physical_cores > 0)) || physical_cores="$logical_cpus"
 
@@ -277,13 +297,10 @@ render_numa() {
 }
 
 render_memory() {
-  local total available used swap_total swap_free swap_used used_pct swap_pct
-  total="$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
-  available="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"
-  swap_total="$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)"
-  swap_free="$(awk '/^SwapFree:/{print $2}' /proc/meminfo)"
+  local total available used swap_total swap_used used_pct swap_pct
+  read -r total available <<<"$(mem_info_kib)"
+  read -r swap_total swap_used <<<"$(swap_info_kib)"
   used=$((total - available))
-  swap_used=$((swap_total - swap_free))
   ((total > 0)) && used_pct=$((100 * used / total)) || used_pct=0
   ((swap_total > 0)) && swap_pct=$((100 * swap_used / swap_total)) || swap_pct=0
   printf '%sMemory%s  %s / %s used  %3d%%  ' "$C_BOLD" "$C_RESET" \
@@ -298,17 +315,17 @@ render_users() {
   printf '%sTop users%s  %s(sum of process %%CPU; 100%% = one logical CPU)%s\n' \
     "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
   printf '  %-16s %10s %12s %10s\n' USER CPU% RSS PROCS
-  ps -e -o user=,pcpu=,rss= 2>/dev/null | awk '
+  ps -A -o user=,pcpu=,rss= 2>/dev/null | awk '
     {cpu[$1]+=$2; rss[$1]+=$3; count[$1]++}
     END {for (u in cpu) printf "%-16s %10.1f %12.0f %10d\n", u, cpu[u], rss[u], count[u]}
-  ' | sort -k2,2nr | head -n "$TOP_COUNT" | awk '
+  ' | sort -k2,2nr | awk -v n="$TOP_COUNT" '
     function human(k) {
       if (k >= 1073741824) return sprintf("%.1f TiB", k/1073741824)
       if (k >= 1048576) return sprintf("%.1f GiB", k/1048576)
       if (k >= 1024) return sprintf("%.1f MiB", k/1024)
       return sprintf("%.0f KiB", k)
     }
-    {printf "  %-16s %10s %12s %10s\n", $1, $2, human($3), $4}
+    NR <= n {printf "  %-16s %10s %12s %10s\n", $1, $2, human($3), $4}
   '
 }
 
@@ -316,15 +333,15 @@ render_processes() {
   printf '%sTop processes%s  %s(%%CPU may exceed 100 for multi-threaded processes)%s\n' \
     "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
   printf '  %-8s %-14s %8s %7s %10s %-5s %s\n' PID USER CPU% MEM% RSS STAT COMMAND
-  ps -e -o pid=,user=,pcpu=,pmem=,rss=,stat=,comm= --sort=-pcpu 2>/dev/null | \
-    head -n "$TOP_COUNT" | awk '
+  ps -A -o pid=,user=,pcpu=,pmem=,rss=,state=,comm= 2>/dev/null | \
+    sort -k3,3nr | awk -v n="$TOP_COUNT" '
       function human(k) {
         if (k >= 1073741824) return sprintf("%.1fT", k/1073741824)
         if (k >= 1048576) return sprintf("%.1fG", k/1048576)
         if (k >= 1024) return sprintf("%.1fM", k/1024)
         return sprintf("%.0fK", k)
       }
-      {printf "  %-8s %-14s %8s %7s %10s %-5s %s\n", $1,$2,$3,$4,human($5),$6,$7}
+      NR <= n {printf "  %-8s %-14s %8s %7s %10s %-5s %s\n", $1,$2,$3,$4,human($5),$6,$7}
     '
 }
 
@@ -332,9 +349,9 @@ render_dashboard() {
   local width now host uptime_text load1 load5 load15 util load_ratio status status_color
   width="$(terminal_width)"
   now="$(date '+%F %T')"
-  host="$(hostname -s 2>/dev/null || hostname)"
-  uptime_text="$(uptime -p 2>/dev/null | sed 's/^up //' || true)"
-  read -r load1 load5 load15 _ </proc/loadavg
+  host="$(host_short)"
+  uptime_text="$(uptime_pretty)"
+  read -r load1 load5 load15 <<<"$(loadavg_values)"
   util="${CPU_UTIL[cpu]:-0}"
   load_ratio="$(awk -v l="$load1" -v c="$logical_cpus" 'BEGIN{if(c>0)printf "%.0f",100*l/c; else print 0}')"
   if ((util >= 90 || load_ratio >= 100)); then
@@ -358,7 +375,12 @@ render_dashboard() {
     "$C_BOLD" "$C_RESET" "$load1" "$load5" "$load15" "$load_ratio" \
     "$C_BOLD" "$C_RESET" "$uptime_text"
   printf '\n'
-  render_numa
+  if has_procfs; then
+    render_numa
+  else
+    printf '%sNUMA / per-core heat map: not available on %s (overall CPU above)%s\n' \
+      "$C_DIM" "$PLATFORM" "$C_RESET"
+  fi
   printf '\n'
   render_memory
   printf '\n'
@@ -374,17 +396,17 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-read_initial_snapshot
+init_cpu_sample
 if [[ -n "$WATCH_INTERVAL" ]]; then
   [[ -t 1 ]] && printf '\033[?25l'
   while :; do
     sleep "$WATCH_INTERVAL"
-    read_cpu_sample
+    sample_cpu
     [[ -t 1 ]] && printf '\033[H\033[2J'
     render_dashboard
   done
 else
   sleep "$SAMPLE_INTERVAL"
-  read_cpu_sample
+  sample_cpu
   render_dashboard
 fi

@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 
 # Terminal dashboard for NVIDIA GPUs. No jq/python dependency required.
 set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/platform.sh
+source "${SCRIPT_DIR}/lib/platform.sh"
 
 PROGRAM_NAME="${0##*/}"
 WATCH_INTERVAL=""
@@ -230,11 +235,14 @@ gpu_status() {
 }
 
 system_memory_summary() {
-  if command -v free >/dev/null 2>&1; then
-    free -h 2>/dev/null | awk '/^Mem:/ { print $3 "/" $2 }'
-  else
+  local total available used
+  read -r total available <<<"$(mem_info_kib)"
+  if ((total <= 0)); then
     printf 'n/a'
+    return
   fi
+  used=$((total - available))
+  printf '%s/%s' "$(human_kib_iec "$used")" "$(human_kib_iec "$total")" | tr -d ' '
 }
 
 render_dashboard() {
@@ -263,9 +271,10 @@ render_dashboard() {
   driver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n 1 | tr -d '[:space:]')"
   cuda_version="$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version:[[:space:]]*\([^ ]*\).*/\1/p' | head -n 1)"
   gpu_count="$(printf '%s\n' "$gpu_data" | awk 'NF { n++ } END { print n+0 }')"
-  host="$(hostname -s 2>/dev/null || hostname)"
+  host="$(host_short)"
   now="$(date '+%Y-%m-%d %H:%M:%S')"
-  load="$(awk '{ print $1 ", " $2 ", " $3 }' /proc/loadavg 2>/dev/null || printf 'n/a')"
+  load="$(loadavg_values | awk '{ print $1 ", " $2 ", " $3 }')"
+  [[ -n "$load" ]] || load="n/a"
   system_mem="$(system_memory_summary)"
 
   printf '%s%sNVIDIA GPU DASHBOARD%s  %s%s%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_BOLD" "$host" "$C_RESET"
