@@ -18,6 +18,7 @@ install-fast/       一键环境安装与 agent 安装器
   install-user.sh     用户态安装（无需 root）
   install-root.sh     系统级安装（自动 sudo）
   install-agent.sh    交互式 coding-agent / harness 安装器
+  install-mihomo.sh   mihomo（Clash Meta）代理安装器
 tools/              只读终端看板
   cpu-board.sh        CPU / NUMA / 进程看板
   gpu-board.sh        NVIDIA GPU 看板
@@ -117,6 +118,37 @@ sudo ./install-fast/install-root.sh
 缺少 Node/npm 时，会用 `fnm` 在用户态引导安装 Node（失败再回退到 conda）。由于
 部分网络下 `fnm.vercel.app` 很慢/被墙，安装器改从 GitHub release 取 fnm 二进制，
 Node 本体走 `npmmirror.com`。
+
+### 3. mihomo 代理安装器
+
+把 [mihomo](https://github.com/MetaCubeX/mihomo)（Clash Meta）装进一个配置目录，
+并生成控制脚本和 shell 代理环境。
+
+```bash
+./install-fast/install-mihomo.sh                     # 装到 ~/Mihomo
+./install-fast/install-mihomo.sh --start             # 装完即启动
+./install-fast/install-mihomo.sh --config-url 'https://.../sub' --force-config
+./install-fast/install-mihomo.sh --proxy http://127.0.0.1:17890 --port 17890
+```
+
+默认目录：用户态 `~/Mihomo`，root 态 `/etc/mihomo`：
+
+```
+mihomo         发布二进制
+config.yaml    最小模板，或你的订阅配置
+proxy-env.sh   source 后导出 HTTP(S)_PROXY / ALL_PROXY
+mihomoctl      start | stop | restart | status
+```
+
+参数：`--dir`、`--port`、`--controller-port`、`--config-url`、`--force-config`、
+`--version`、`--proxy`、`--with-service`、`--start`、`--dry-run`、`--no-color`。
+
+```bash
+source ~/Mihomo/proxy-env.sh
+~/Mihomo/mihomoctl start
+# 让 github.com 的 git 走该代理：
+git config --global http.https://github.com/.proxy http://127.0.0.1:17890
+```
 
 ## tools
 

@@ -20,6 +20,7 @@ install-fast/       one-click environment and agent installers
   install-user.sh     user-space install (no root)
   install-root.sh     system-wide install (auto-sudo)
   install-agent.sh    interactive coding-agent / harness installer
+  install-mihomo.sh   mihomo (Clash Meta) proxy installer
 tools/              read-only terminal dashboards
   cpu-board.sh        CPU / NUMA / process dashboard
   gpu-board.sh        NVIDIA GPU dashboard
@@ -122,6 +123,37 @@ At the prompt, enter numbers or keys separated by commas (`1,4,6` or
 Node/npm are bootstrapped into user space with `fnm` when missing (falling back
 to conda). Because `fnm.vercel.app` is slow/blocked in some networks, the binary
 is fetched from GitHub releases and Node itself from `npmmirror.com`.
+
+### 3. mihomo proxy installer
+
+Install [mihomo](https://github.com/MetaCubeX/mihomo) (Clash Meta) into a config
+directory, together with a control script and a shell proxy environment.
+
+```bash
+./install-fast/install-mihomo.sh                     # into ~/Mihomo
+./install-fast/install-mihomo.sh --start             # install and start
+./install-fast/install-mihomo.sh --config-url 'https://.../sub' --force-config
+./install-fast/install-mihomo.sh --proxy http://127.0.0.1:17890 --port 17890
+```
+
+Installs into `~/Mihomo` (user) or `/etc/mihomo` (root) by default:
+
+```
+mihomo         the release binary
+config.yaml    a minimal template, or your subscription config
+proxy-env.sh   source it to export HTTP(S)_PROXY / ALL_PROXY
+mihomoctl      start | stop | restart | status
+```
+
+Flags: `--dir`, `--port`, `--controller-port`, `--config-url`, `--force-config`,
+`--version`, `--proxy`, `--with-service`, `--start`, `--dry-run`, `--no-color`.
+
+```bash
+source ~/Mihomo/proxy-env.sh
+~/Mihomo/mihomoctl start
+# route git for github.com through the proxy:
+git config --global http.https://github.com/.proxy http://127.0.0.1:17890
+```
 
 ## tools
 
