@@ -23,6 +23,7 @@ tools/              只读终端看板
   cpu-board.sh        CPU / NUMA / 进程看板
   gpu-board.sh        NVIDIA GPU 看板
   docker-board.sh     Docker 看板（含 owner 推断）
+  install-aliases.sh  为看板安装 shell 别名（.bashrc / .zshrc）
 tools/lib/
   platform.sh         Linux + macOS 可移植层（被看板 source）
 ```
@@ -35,6 +36,7 @@ tools/lib/
 | `tools/cpu-board.sh` | 支持 | 仅整体 CPU（无 NUMA / 逐核热力图） |
 | `tools/gpu-board.sh` | 支持（需 `nvidia-smi`） | 不适用（无 NVIDIA `nvidia-smi`） |
 | `tools/docker-board.sh` | 支持 | 支持（Docker Desktop） |
+| `tools/install-aliases.sh` | 支持 | 支持 |
 
 架构：`x86_64` / `amd64` 与 `aarch64` / `arm64`。
 
@@ -195,6 +197,21 @@ tools/docker-board.sh CONTAINER     # 单个容器的详细信息
 
 展示容器状态、CPU / 内存，以及推断出的宿主 `OWNER`（Docker 不记录谁启动的容器，
 owner 由 Compose 工作目录和 bind mount 路径推断）。默认隐藏 Harbor 网络 sidecar。
+
+### install-aliases.sh
+
+安装 `ccc`（CPU）/ `ggg`（GPU）/ `ddd`（Docker）别名，让看板可以在任意目录直接运行。
+别名总是写入 `~/.bashrc`；当登录 shell 是 zsh 或 `~/.zshrc` 已存在时，也会同时写入
+`~/.zshrc`。
+
+```bash
+tools/install-aliases.sh            # 安装 / 刷新别名
+tools/install-aliases.sh --remove   # 移除别名
+```
+
+别名放在 `# >>> infra-tools >>>` 托管块中，每次运行都会整体替换该块：移动仓库目录后
+重新运行即可刷新路径，其余 shell 配置不会被改动。安装后开一个新终端（或
+`source ~/.bashrc`）即可使用。
 
 ## 设计原则
 

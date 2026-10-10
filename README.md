@@ -25,6 +25,7 @@ tools/              read-only terminal dashboards
   cpu-board.sh        CPU / NUMA / process dashboard
   gpu-board.sh        NVIDIA GPU dashboard
   docker-board.sh     Docker dashboard with owner inference
+  install-aliases.sh  install shell aliases for the boards (.bashrc / .zshrc)
 tools/lib/
   platform.sh         Linux + macOS portability shim (sourced by the boards)
 ```
@@ -37,6 +38,7 @@ tools/lib/
 | `tools/cpu-board.sh` | yes | overall CPU only (no NUMA / per-core heat map) |
 | `tools/gpu-board.sh` | yes (needs `nvidia-smi`) | n/a (no NVIDIA `nvidia-smi`) |
 | `tools/docker-board.sh` | yes | yes (Docker Desktop) |
+| `tools/install-aliases.sh` | yes | yes |
 
 Architectures: `x86_64` / `amd64` and `aarch64` / `arm64`.
 
@@ -203,6 +205,22 @@ Shows container state, CPU / memory and an inferred host `OWNER` (Docker does
 not record who ran a container; the owner is inferred from Compose working
 directories and bind-mount paths). Harbor network sidecars are hidden by
 default.
+
+### install-aliases.sh
+
+Install `ccc` (CPU) / `ggg` (GPU) / `ddd` (Docker) aliases so the boards can be
+run from anywhere. The block always goes into `~/.bashrc`, and into `~/.zshrc`
+as well when zsh is your login shell or the file exists.
+
+```bash
+tools/install-aliases.sh            # install / refresh the aliases
+tools/install-aliases.sh --remove   # take them back out
+```
+
+The aliases live in a managed `# >>> infra-tools >>>` block that is replaced on
+every run, so re-running after moving the repo refreshes the paths and your
+other shell configuration is never touched. Open a new shell (or
+`source ~/.bashrc`) to use them.
 
 ## Design principles
 
