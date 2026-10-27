@@ -111,12 +111,15 @@ hr() {
   printf '\n'
 }
 
+# Truncates "$1" to "$2" characters into the variable named "$3". Output goes
+# to a variable because this runs once per row and a subshell per column is
+# measurable on hundreds of containers.
 shorten() {
   local value="$1" limit="$2"
   if ((${#value} > limit)); then
-    printf '%s…' "${value:0:limit-1}"
+    printf -v "$3" '%s…' "${value:0:limit-1}"
   else
-    printf '%s' "$value"
+    printf -v "$3" '%s' "$value"
   fi
 }
 
@@ -124,40 +127,54 @@ human_bytes() {
   human_bytes_iec "${1:-0}"
 }
 
+# Owner inference results: OWNER_ID is the inferred account ("?" when nothing
+# matched) and OWNER_EVIDENCE the path or file owner it came from.
+OWNER_ID=""
+OWNER_EVIDENCE=""
+
+# Sets OWNER_ID/OWNER_EVIDENCE from one path; returns 1 when it holds no clue.
 owner_from_path() {
   local path="$1" candidate owner
   case "$path" in
     /home/*/*|/home/*)
       candidate="${path#/home/}"; candidate="${candidate%%/*}"
-      user_exists "$candidate" && { printf '%s|path:%s' "$candidate" "$path"; return; }
+      if user_exists "$candidate"; then OWNER_ID="$candidate"; OWNER_EVIDENCE="path:$path"; return 0; fi
       ;;
     /mnt/nvme/*/*|/mnt/nvme/*)
       candidate="${path#/mnt/nvme/}"; candidate="${candidate%%/*}"
-      user_exists "$candidate" && { printf '%s|path:%s' "$candidate" "$path"; return; }
+      if user_exists "$candidate"; then OWNER_ID="$candidate"; OWNER_EVIDENCE="path:$path"; return 0; fi
       ;;
   esac
   if [[ -e "$path" ]]; then
     owner="$(file_owner "$path" || true)"
-    [[ -n "$owner" && "$owner" != "root" ]] && { printf '%s|owner:%s' "$owner" "$path"; return; }
+    if [[ -n "$owner" && "$owner" != "root" ]]; then OWNER_ID="$owner"; OWNER_EVIDENCE="owner:$path"; return 0; fi
   fi
   return 1
 }
 
+# JSON filter for the paths OWNER can be inferred from, best clue first: the
+# Compose project working dir, then every bind-mount source. Also interpolated
+# into the row collector of print_table, so both views agree on the ordering.
+JQ_OWNER_PATHS='[ (.Config.Labels["com.docker.compose.project.working_dir"] // empty) ] + [ .Mounts[]? | select(.Type == "bind") | .Source ]'
+
+# Prints the owner path candidates of one `docker inspect` result array.
+owner_paths_from_inspect() {
+  jq -r ".[0] | ${JQ_OWNER_PATHS}"' | join("\u001e")'
+}
+
+# Sets OWNER_ID/OWNER_EVIDENCE from "\x1e"-joined candidate paths (best clue
+# first). Falls back to "?", the same marker the table always showed.
 infer_owner() {
-  local json="$1" path result
-  path="$(jq -r '.[0].Config.Labels["com.docker.compose.project.working_dir"] // empty' <<<"$json")"
-  if [[ -n "$path" ]] && result="$(owner_from_path "$path")"; then
-    printf '%s' "$result"
-    return
-  fi
-  while IFS= read -r path; do
+  local rest="${1:-}" path
+  OWNER_ID="?"
+  OWNER_EVIDENCE="no reliable path clue"
+  while [[ -n "$rest" ]]; do
+    path="${rest%%$'\x1e'*}"
+    if [[ "$rest" == *$'\x1e'* ]]; then rest="${rest#*$'\x1e'}"; else rest=""; fi
     [[ -n "$path" ]] || continue
-    if result="$(owner_from_path "$path")"; then
-      printf '%s' "$result"
-      return
-    fi
-  done < <(jq -r '.[0].Mounts[]? | select(.Type == "bind") | .Source' <<<"$json")
-  printf '?|no reliable path clue'
+    owner_from_path "$path" && return 0
+  done
+  return 0
 }
 
 state_text() {
@@ -172,36 +189,6 @@ state_text() {
     paused|restarting) printf '%s%s%s' "$C_YELLOW" "$status" "$C_RESET" ;;
     *) printf '%s' "$status" ;;
   esac
-}
-
-compact_age() {
-  sed -E \
-    -e 's/^About //' \
-    -e 's/^Less than a second/<1s/' \
-    -e 's/ seconds?/s/' \
-    -e 's/ minutes?/m/' \
-    -e 's/ hours?/h/' \
-    -e 's/ days?/d/' \
-    -e 's/ weeks?/w/' \
-    -e 's/ months?/mo/' \
-    -e 's/ years?/y/' \
-    -e 's/ ago$//'
-}
-
-percent_color() {
-  local value="${1%%%}" warn="$2" high="$3"
-  [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] || { printf '%s' "$C_DIM"; return; }
-  awk -v v="$value" -v h="$high" 'BEGIN { exit !(v >= h) }' && { printf '%s' "$C_RED"; return; }
-  awk -v v="$value" -v w="$warn" 'BEGIN { exit !(v >= w) }' && { printf '%s' "$C_YELLOW"; return; }
-  printf '%s' "$C_GREEN"
-}
-
-cpu_color() {
-  local value="${1%%%}"
-  [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] || { printf '%s' "$C_DIM"; return; }
-  awk -v v="$value" 'BEGIN { exit !(v >= 200) }' && { printf '%s' "$C_MAGENTA"; return; }
-  awk -v v="$value" 'BEGIN { exit !(v >= 70) }' && { printf '%s' "$C_YELLOW"; return; }
-  printf '%s' "$C_GREEN"
 }
 
 print_header() {
@@ -226,14 +213,67 @@ print_header() {
 }
 
 print_table() {
-  local ids id json name image status health state age owner_pair owner cpu mem mem_pct
-  local name_w image_w width status_color cpu_c mem_c hidden=0
-  # Keep stats as a plain table looked up per id; associative arrays would
-  # need bash 4+, but macOS ships bash 3.2.
-  local stats stats_line
-  stats="$(docker stats --no-stream --format '{{.ID}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}' 2>/dev/null || true)"
+  local ids ages stats rows line name image status health state age
+  local short_name short_owner short_state short_age short_image
+  local cpu mem cpu_level mem_level name_w image_w width status_color cpu_c mem_c hidden=0
+  local -a fields
 
   if ((SHOW_ALL)); then ids="$(docker ps -aq)"; else ids="$(docker ps -q)"; fi
+  if [[ -n "$ids" ]]; then
+    # Collection is batched: `docker ps`, `docker ps -a`, `docker stats` and
+    # one bulk `docker inspect`, however many containers there are. Per-container
+    # docker calls made this unusable on hosts with hundreds of containers
+    # (each CLI round-trip costs ~60 ms).
+    ages="$(docker ps -a --format '{{.ID}}|{{.RunningFor}}')"
+    stats="$(docker stats --no-stream --format '{{.ID}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}' 2>/dev/null || true)"
+    # shellcheck disable=SC2086  # one container id per argument
+    rows="$(docker inspect --format '{{json .}}' $ids 2>/dev/null |
+      jq -n -r --arg ages "$ages" --arg stats "$stats" '
+        # "id|value" lines -> {id: [values]}, so the per-row lookups below are
+        # plain object indexing instead of a process per container. Keys are the
+        # 12-char id prefix, which is also what the row lookup uses.
+        def keyed:
+          split("\n")
+          | map(select(length > 0) | split("|"))
+          | map({key: .[0][0:12], value: .[1:]})
+          | from_entries;
+        # Same rewrites as `docker ps` RunningFor -> the compact AGE column.
+        def age_text:
+          sub("^About "; "")
+          | sub("^Less than a second"; "<1s")
+          | sub(" seconds?"; "s") | sub(" minutes?"; "m") | sub(" hours?"; "h")
+          | sub(" days?"; "d") | sub(" weeks?"; "w") | sub(" months?"; "mo")
+          | sub(" years?"; "y")
+          | sub(" ago$"; "");
+        def level($warn; $high):
+          (sub("%$"; "")) as $v
+          | if ($v | test("^[0-9]+(\\.[0-9]+)?$")) then
+              ($v | tonumber) as $n
+              | if $n >= $high then "high" elif $n >= $warn then "warn" else "ok" end
+            else "dim" end;
+        ($ages | keyed) as $age_by_id
+        | ($stats | keyed) as $stats_by_id
+        | inputs
+        | .Id[0:12] as $id
+        | ($stats_by_id[$id] // null) as $s
+        | [ ((.Name // "") | ltrimstr("/")),
+            (.Config.Image // ""),
+            (.State.Status // ""),
+            (.State.Health.Status // ""),
+            (($age_by_id[$id] // [""])[0] | age_text),
+            (if $s == null then "-" else $s[0] end),
+            (if $s == null then "-"
+             else ($s[1] | split(" / ")[0] | sub("KiB"; "K") | sub("MiB"; "M")
+                   | sub("GiB"; "G") | sub("TiB"; "T"))
+             end),
+            (if $s == null then "dim" else ($s[0] | level(70; 200)) end),
+            (if $s == null then "dim" else ($s[2] | level(70; 90)) end)
+          ]
+          + [ ('"${JQ_OWNER_PATHS}"') | join("\u001e") ]
+        | map(tostring) | join("\u001f")
+      ')"
+  fi
+
   printf '\n%s%sCONTAINERS%s%s\n' "$C_BOLD" "$C_CYAN" "$([[ $SHOW_ALL -eq 1 ]] && printf ' (ALL)' || true)" "$C_RESET"
   if [[ -z "$ids" ]]; then
     printf '%sNo containers found.%s\n' "$C_DIM" "$C_RESET"
@@ -244,27 +284,26 @@ print_table() {
   if ((width < 110)); then name_w=20; image_w=13; else name_w=31; image_w=30; fi
   printf '%s%-*s  %-9s  %-10s  %-7s  %8s  %9s  %-*s%s\n' \
     "$C_BOLD$C_DIM" "$name_w" 'NAME' 'OWNER*' 'STATE' 'AGE' 'CPU' 'MEM' "$image_w" 'IMAGE' "$C_RESET"
-  while IFS= read -r id; do
-    [[ -n "$id" ]] || continue
-    json="$(docker inspect "$id")"
-    name="$(jq -r '.[0].Name | ltrimstr("/")' <<<"$json")"
-    image="$(jq -r '.[0].Config.Image' <<<"$json")"
+  # One "\x1f"-separated row per container: name image status health age cpu mem
+  # cpu_level mem_level owner_paths. Fields come from the batched collector above.
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    IFS=$'\x1f' read -r -a fields <<<"$line"
+    name="${fields[0]:-}"
+    image="${fields[1]:-}"
+    status="${fields[2]:-}"
+    health="${fields[3]:-}"
+    age="${fields[4]:-}"
+    cpu="${fields[5]:--}"
+    mem="${fields[6]:--}"
+    cpu_level="${fields[7]:-dim}"
+    mem_level="${fields[8]:-dim}"
     if ((SHOW_SIDECARS == 0)) && [[ "$name" == *harbor-docker-egress-control-sidecar* || "$image" == *harbor-docker-egress-control-sidecar* ]]; then
       ((hidden+=1))
       continue
     fi
-    status="$(jq -r '.[0].State.Status' <<<"$json")"
-    health="$(jq -r '.[0].State.Health.Status // empty' <<<"$json")"
-    age="$(docker ps -a --filter "id=$id" --format '{{.RunningFor}}' | head -n1 | compact_age)"
-    owner_pair="$(infer_owner "$json")"; owner="${owner_pair%%|*}"
-    stats_line="$(printf '%s\n' "$stats" | awk -F'|' -v id="$id" '$1 == id {print; exit}')"
-    if [[ -n "$stats_line" ]]; then
-      IFS='|' read -r _ cpu mem mem_pct <<<"$stats_line"
-      mem="${mem%% / *}"
-      mem="${mem//KiB/K}"; mem="${mem//MiB/M}"; mem="${mem//GiB/G}"; mem="${mem//TiB/T}"
-    else
-      cpu="-"; mem="-"; mem_pct="-"
-    fi
+    infer_owner "${fields[9]:-}"
+    owner="$OWNER_ID"
     case "$status/$health" in
       running/healthy) state='healthy'; status_color="$C_GREEN" ;;
       running/unhealthy) state='unhealthy'; status_color="$C_RED" ;;
@@ -273,16 +312,32 @@ print_table() {
       paused/*|restarting/*) state="$status"; status_color="$C_YELLOW" ;;
       *) state="$status"; status_color="$C_DIM" ;;
     esac
-    cpu_c="$(cpu_color "$cpu")"; mem_c="$(percent_color "$mem_pct" 70 90)"
+    case "$cpu_level" in
+      high) cpu_c="$C_MAGENTA" ;;
+      warn) cpu_c="$C_YELLOW" ;;
+      ok) cpu_c="$C_GREEN" ;;
+      *) cpu_c="$C_DIM" ;;
+    esac
+    case "$mem_level" in
+      high) mem_c="$C_RED" ;;
+      warn) mem_c="$C_YELLOW" ;;
+      ok) mem_c="$C_GREEN" ;;
+      *) mem_c="$C_DIM" ;;
+    esac
+    shorten "$name" "$name_w" short_name
+    shorten "$owner" 9 short_owner
+    shorten "$state" 10 short_state
+    shorten "$age" 7 short_age
+    shorten "$image" "$image_w" short_image
     printf '%-*s  %s%-9s%s  %s%-10s%s  %-7s  %s%8s%s  %s%9s%s  %s%-*s%s\n' \
-      "$name_w" "$(shorten "$name" "$name_w")" \
-      "$C_CYAN" "$(shorten "$owner" 9)" "$C_RESET" \
-      "$status_color" "$(shorten "$state" 10)" "$C_RESET" \
-      "$(shorten "$age" 7)" \
+      "$name_w" "$short_name" \
+      "$C_CYAN" "$short_owner" "$C_RESET" \
+      "$status_color" "$short_state" "$C_RESET" \
+      "$short_age" \
       "$cpu_c" "$cpu" "$C_RESET" \
       "$mem_c" "$mem" "$C_RESET" \
-      "$C_BLUE" "$image_w" "$(shorten "$image" "$image_w")" "$C_RESET"
-  done <<<"$ids"
+      "$C_BLUE" "$image_w" "$short_image" "$C_RESET"
+  done <<<"$rows"
   if ((hidden > 0)); then
     printf '%s… %s Harbor network sidecar(s) hidden; use --sidecars to show them.%s\n' "$C_DIM" "$hidden" "$C_RESET"
   fi
@@ -294,7 +349,7 @@ print_table() {
 }
 
 print_detail() {
-  local json id name image created status health pid started finished restart internal_user owner_pair owner evidence
+  local json id name image created status health pid started finished restart internal_user owner evidence
   local command_line project service workdir ports mounts networks env_count memory nano cpuset gpus log_driver
   json="$(docker inspect "$TARGET" 2>/dev/null)" || die "container not found: $TARGET"
   id="$(jq -r '.[0].Id[0:12]' <<<"$json")"
@@ -308,7 +363,7 @@ print_detail() {
   finished="$(jq -r '.[0].State.FinishedAt' <<<"$json")"
   restart="$(jq -r '.[0].RestartCount' <<<"$json")"
   internal_user="$(jq -r '.[0].Config.User // empty' <<<"$json")"; [[ -n "$internal_user" ]] || internal_user='image default (usually root)'
-  owner_pair="$(infer_owner "$json")"; owner="${owner_pair%%|*}"; evidence="${owner_pair#*|}"
+  infer_owner "$(owner_paths_from_inspect <<<"$json")"; owner="$OWNER_ID"; evidence="$OWNER_EVIDENCE"
   command_line="$(jq -r '.[0] | ((.Path // "") + " " + ((.Args // []) | join(" "))) ' <<<"$json")"
   project="$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // "-"' <<<"$json")"
   service="$(jq -r '.[0].Config.Labels["com.docker.compose.service"] // "-"' <<<"$json")"
