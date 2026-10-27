@@ -1,0 +1,13 @@
+# qgpu runtime state (per-user queue, never committed)
+qgpu/qgpu.db
+qgpu/qgpu.db-shm
+qgpu/qgpu.db-wal
+qgpu/config.json
+qgpu/logs/
+qgpu/scheduler.log
+qgpu/scheduler.pid
+qgpu/scheduler.lock
+
+# python bytecode
+__pycache__/
+*.pyc

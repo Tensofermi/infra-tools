@@ -12,10 +12,14 @@ DRY_RUN=0
 MIRROR=1
 USE_SUDO=0
 DISABLE_COLOR=0
-SELECTED="base,cli,dev,python"
+SELECTED="base,cli,dev,python,qgpu"
 PKG_MGR=""
 SUDO_CMD=""
 CAN_SYSTEM=0
+
+# install-fast/ lives next to the component directories it can wire up.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+QGPU_SRC="${REPO_ROOT}/qgpu"
 
 case "$MODE" in
   root)
@@ -391,6 +395,22 @@ do_python() {
   install_conda
 }
 
+do_qgpu() {
+  log "qGPU job queue (qgpu)"
+  if [[ "$MODE" == "root" ]]; then
+    warn "qGPU keeps per-user state; run ./install-fast/install-user.sh --only qgpu"
+    return 0
+  fi
+  local installer="${QGPU_SRC}/install.sh"
+  if [[ ! -f "$installer" ]]; then
+    warn "qgpu/install.sh not found under ${QGPU_SRC}"
+    return 0
+  fi
+  local -a flags=(--bin-dir "$BIN_DIR")
+  ((DRY_RUN)) && flags+=(--dry-run)
+  bash "$installer" "${flags[@]}"
+}
+
 list_groups() {
   cat <<EOF
 Groups:
@@ -398,6 +418,7 @@ Groups:
   cli     tree ripgrep(rg) fd fzf tmux htop
   dev     g++/build-essential make gdb cmake ninja pkg-config
   python  uv + conda (Miniforge, includes mamba)
+  qgpu    qGPU per-user GPU job queue CLI (needs python3 + nvidia-smi)
 EOF
 }
 
@@ -475,7 +496,7 @@ tool_path() {
 verify() {
   printf '\n%sInstalled tool summary%s\n' "$C_BOLD" "$C_RESET"
   local t path
-  for t in git curl wget jq tree rg fd fzf tmux htop g++ make cmake uv conda; do
+  for t in git curl wget jq tree rg fd fzf tmux htop g++ make cmake uv conda qgpu; do
     if path="$(tool_path "$t")"; then
       printf '  %s%-6s%s %s\n' "$C_GREEN" "$t" "$C_RESET" "$path"
     else
@@ -494,7 +515,7 @@ Usage: ${prog} [options]
 One-shot installer for a fresh dev/GPU server. Idempotent: safe to re-run.
 
 Options:
-      --only GROUPS     Comma list: base,cli,dev,python (default: all)
+      --only GROUPS     Comma list: base,cli,dev,python,qgpu (default: all)
       --skip GROUPS     Remove groups from the default set
       --dry-run         Print actions without changing anything
       --no-mirror       Do not write pip/uv/conda/HF China mirrors
@@ -560,7 +581,7 @@ main() {
   for g in "${_groups[@]}"; do
     case "$g" in
       "") ;;
-      base|cli|dev|python) "do_$g" ;;
+      base|cli|dev|python|qgpu) "do_$g" ;;
       *) warn "unknown group: $g" ;;
     esac
   done

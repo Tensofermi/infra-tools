@@ -26,6 +26,13 @@ tools/              只读终端看板
   install-aliases.sh  为看板安装 shell 别名（.bashrc / .zshrc）
 tools/lib/
   platform.sh         Linux + macOS 可移植层（被看板 source）
+qgpu/               自完备的 GPU 作业队列（Python 3 标准库 + nvidia-smi）
+  qgpu.py             命令行：submit / list / show / logs / cancel / start / stop
+  scheduler.py        后台调度器：寻找空闲卡并启动作业
+  common.py           配置、状态目录、SQLite、nvidia-smi 查询
+  install.sh          复制到私有目录并在 PATH 上放 `qgpu` 启动器
+  qgpu, run.sh, stop.sh  直接跑仓库内代码用的启动脚本
+  README.md           完整使用手册
 ```
 
 ## 平台支持
@@ -37,6 +44,7 @@ tools/lib/
 | `tools/gpu-board.sh` | 支持（需 `nvidia-smi`） | 不适用（无 NVIDIA `nvidia-smi`） |
 | `tools/docker-board.sh` | 支持 | 支持（Docker Desktop） |
 | `tools/install-aliases.sh` | 支持 | 支持 |
+| `qgpu/` | 支持（需 `python3` + `nvidia-smi`） | 不适用（无 NVIDIA `nvidia-smi`） |
 
 架构：`x86_64` / `amd64` 与 `aarch64` / `arm64`。
 
@@ -68,6 +76,7 @@ sudo ./install-fast/install-root.sh
 | `cli` | tree、ripgrep（`rg`）、fd、fzf、tmux、htop |
 | `dev` | g++ / build-essential、make、gdb、cmake、ninja、pkg-config |
 | `python` | uv + conda（Miniforge，自带 `mamba`） |
+| `qgpu` | 个人 GPU 作业队列命令行（见下文） |
 
 参数：
 
@@ -213,9 +222,60 @@ tools/install-aliases.sh --remove   # 移除别名
 重新运行即可刷新路径，其余 shell 配置不会被改动。安装后开一个新终端（或
 `source ~/.bashrc`）即可使用。
 
+## qgpu
+
+一个自完备的 GPU 作业队列，服务对象正是这些安装器准备的共享服务器。提交命令后，
+后台调度器在真正空闲的 NVIDIA 卡上启动它，`CUDA_VISIBLE_DEVICES` 已自动设好。
+只依赖 `python3`（标准库）与 `nvidia-smi`。
+
+不绑定任何特定机器：每一轮调度都会重新从 `nvidia-smi` 发现 GPU 池，因此任意卡数、
+混合型号、不连续编号、甚至换机后卡变少都能正常工作。只有当某张卡上没有任何用户的
+计算进程、且显存占用低于 `free_memory_mib` 时，才视为空闲。
+
+```bash
+./install-fast/install-user.sh --only qgpu   # 安装 `qgpu` 启动器
+qgpu detect                                  # 看 nvidia-smi 能看到什么
+qgpu start                                   # 启动调度器
+
+qgpu submit --name L12 -- python train.py    # 提交作业
+qgpu list                                    # 查看队列
+qgpu logs -f 12                              # 跟踪 job 12 日志
+qgpu status                                  # 调度器状态 + 每卡概览
+```
+
+| 命令 | 作用 |
+|------|------|
+| `start` / `stop` | 启动 / 停止调度器（`stop` 不会杀掉运行中的作业） |
+| `status` / `detect` | 队列与 GPU 概览 / `nvidia-smi` 原始清单 |
+| `submit`（`sb`） | 提交作业；`--gpus N`、`--gpu-ids 5,6`、`--cwd`、`--env K=V` |
+| `list`（`ls`）/ `show ID` | 最近作业 / 单个作业详情 |
+| `logs ID [-f]` | 跟踪作业日志 |
+| `cancel ID` / `retry ID` | 取消作业 / 重新提交已结束作业 |
+| `promote ID` / `demote ID` | 把 pending 作业移到队首 / 队尾 |
+| `config` | 查看或修改 `max_gpus`、`gpu_pool`、`poll_seconds`、`free_memory_mib` |
+
+默认配置（`max_gpus: 0` 表示按池大小自动，`gpu_pool: []` 表示全部可见 GPU）：
+
+```json
+{
+  "max_gpus": 0,
+  "gpu_pool": [],
+  "poll_seconds": 2.0,
+  "free_memory_mib": 1024
+}
+```
+
+状态与代码分离，放在 `$QGPU_HOME`（默认 `~/.local/state/qgpu`）；
+`qgpu/install.sh` 把代码复制到私有目录（`~/.local/share/qgpu`），并在
+`~/.local/bin` 放启动器，因此仓库被移动或删除也不影响使用。
+`qgpu/install.sh --remove` 可卸载，且不会删除作业数据库。
+
+完整手册：[qgpu/README.md](./qgpu/README.md)。
+
 ## 设计原则
 
 - 纯 Bash、依赖极少，读看板不需要 root。
+- 可选组件（`qgpu`）保持自完备：只用标准库、私有状态目录，可整体卸载而不污染宿主。
 - 检测平台与包管理器，而不是假设某个发行版。
 - 优雅降级 —— 打印清晰的“此处不支持”，而不是报错。
 - 安装器幂等；托管配置块不会覆盖你的原有配置。

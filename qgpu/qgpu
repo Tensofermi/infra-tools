@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# qGPU 的短命令入口：从任意目录调用 qgpu.py。
+set -euo pipefail
+
+QGPU_ENTRY="$(readlink -f -- "${BASH_SOURCE[0]}")"
+QGPU_DIR="$(cd -- "$(dirname -- "$QGPU_ENTRY")" && pwd)"
+export PYTHONDONTWRITEBYTECODE=1
+exec python3 "$QGPU_DIR/qgpu.py" "$@"

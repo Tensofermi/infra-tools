@@ -28,6 +28,13 @@ tools/              read-only terminal dashboards
   install-aliases.sh  install shell aliases for the boards (.bashrc / .zshrc)
 tools/lib/
   platform.sh         Linux + macOS portability shim (sourced by the boards)
+qgpu/               self-contained GPU job queue (Python 3 stdlib + nvidia-smi)
+  qgpu.py             CLI: submit / list / show / logs / cancel / start / stop
+  scheduler.py        background scheduler; finds idle GPUs and launches jobs
+  common.py           config, state dir, SQLite, nvidia-smi inventory
+  install.sh          copy into a private prefix + `qgpu` launcher on PATH
+  qgpu, run.sh, stop.sh  launchers for running straight from the repo
+  README.md           full manual
 ```
 
 ## Platform support
@@ -39,6 +46,7 @@ tools/lib/
 | `tools/gpu-board.sh` | yes (needs `nvidia-smi`) | n/a (no NVIDIA `nvidia-smi`) |
 | `tools/docker-board.sh` | yes | yes (Docker Desktop) |
 | `tools/install-aliases.sh` | yes | yes |
+| `qgpu/` | yes (needs `python3` + `nvidia-smi`) | n/a (no NVIDIA `nvidia-smi`) |
 
 Architectures: `x86_64` / `amd64` and `aarch64` / `arm64`.
 
@@ -70,6 +78,7 @@ Groups (default: all):
 | `cli` | tree, ripgrep (`rg`), fd, fzf, tmux, htop |
 | `dev` | g++ / build-essential, make, gdb, cmake, ninja, pkg-config |
 | `python` | uv + conda (Miniforge, includes `mamba`) |
+| `qgpu` | per-user GPU job queue CLI (see below) |
 
 Flags:
 
@@ -222,9 +231,65 @@ every run, so re-running after moving the repo refreshes the paths and your
 other shell configuration is never touched. Open a new shell (or
 `source ~/.bashrc`) to use them.
 
+## qgpu
+
+A self-contained GPU job queue, for the same shared servers the installers
+prepare. Queue a command and a background scheduler starts it as soon as a
+genuinely idle NVIDIA GPU exists, with `CUDA_VISIBLE_DEVICES` already set.
+Requires only `python3` (stdlib) and `nvidia-smi`.
+
+Nothing is tied to a particular host: the pool is re-discovered from
+`nvidia-smi` on every scheduling round, so any card count, mixed models,
+non-contiguous indices and changing hardware all work. Cards are considered
+free only when no compute process from **any** user is present and used memory
+is below `free_memory_mib`.
+
+```bash
+./install-fast/install-user.sh --only qgpu   # install the `qgpu` launcher
+qgpu detect                                  # what does nvidia-smi see?
+qgpu start                                   # start the scheduler
+
+qgpu submit --name L12 -- python train.py    # queue a job
+qgpu list                                    # see the queue
+qgpu logs -f 12                              # follow job 12
+qgpu status                                  # scheduler + per-GPU view
+```
+
+| Command | Meaning |
+|---------|---------|
+| `start` / `stop` | start / stop the scheduler (running jobs survive `stop`) |
+| `status` / `detect` | queue and GPU view / raw `nvidia-smi` inventory |
+| `submit` (`sb`) | queue a job; `--gpus N`, `--gpu-ids 5,6`, `--cwd`, `--env K=V` |
+| `list` (`ls`) / `show ID` | recent jobs / one job in detail |
+| `logs ID [-f]` | tail the per-job log |
+| `cancel ID` / `retry ID` | cancel a job / re-queue a finished one |
+| `promote ID` / `demote ID` | move a pending job to the front / back |
+| `config` | print or change `max_gpus`, `gpu_pool`, `poll_seconds`, `free_memory_mib` |
+
+Config defaults (`max_gpus: 0` = pool size, `gpu_pool: []` = every visible GPU):
+
+```json
+{
+  "max_gpus": 0,
+  "gpu_pool": [],
+  "poll_seconds": 2.0,
+  "free_memory_mib": 1024
+}
+```
+
+State lives outside the code, in `$QGPU_HOME` (default `~/.local/state/qgpu`),
+and `qgpu/install.sh` copies the code into a private prefix (`~/.local/share/qgpu`)
+with a launcher in `~/.local/bin`, so the tool keeps working if the repository
+moves or disappears. `qgpu/install.sh --remove` uninstalls it and leaves the
+queue database alone.
+
+Full manual: [qgpu/README.md](./qgpu/README.md).
+
 ## Design principles
 
 - Plain Bash, minimal dependencies, no root required to read a dashboard.
+- Opt-in extras (`qgpu`) stay self-contained: stdlib only, private state dir,
+  removable without touching the host.
 - Detect the platform and package manager instead of assuming one distro.
 - Degrade — print a clear "not supported here" line rather than failing.
 - Idempotent installers; managed config blocks that do not overwrite yours.
