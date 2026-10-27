@@ -50,9 +50,11 @@ $QGPU_HOME/          runtime state, default ~/.local/state/qgpu
 ```
 
 `QGPU_HOME` (or `qgpu --home DIR`) relocates the state; `XDG_STATE_HOME` is
-honoured. If an older copy of qGPU left `qgpu.db` next to the scripts, that
-directory keeps being used as the state dir, so existing queues survive the
-upgrade.
+honoured. `--home` is a global option, so it must come before the subcommand
+(`qgpu --home /tmp/alt status`); everything after `--` belongs to the job
+command and is passed through untouched. If an older copy of qGPU left
+`qgpu.db` next to the scripts, that directory keeps being used as the state
+dir, so existing queues survive the upgrade.
 
 ## Quick start
 
@@ -182,3 +184,7 @@ of cards. `max_gpus` may not exceed the size of the pool.
 - Linux + NVIDIA only; macOS has no `nvidia-smi` and is not supported.
 - State is per user, not shared: two users on the same box get two queues that
   still see each other's GPU usage.
+- A card whose driver reports `[N/A]` for a numeric field (seen on some MIG /
+  virtualised setups) is skipped instead of being treated as idle. If
+  `nvidia-smi --query-compute-apps` fails, other users' processes are not
+  visible and the idle check falls back to the memory threshold alone.

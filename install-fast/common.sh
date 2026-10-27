@@ -408,7 +408,10 @@ do_qgpu() {
   fi
   local -a flags=(--bin-dir "$BIN_DIR")
   ((DRY_RUN)) && flags+=(--dry-run)
-  bash "$installer" "${flags[@]}"
+  if ! bash "$installer" "${flags[@]}"; then
+    warn "qgpu installer failed (python3 is required); re-run: bash ${installer}"
+    return 0
+  fi
 }
 
 list_groups() {
@@ -496,7 +499,10 @@ tool_path() {
 verify() {
   printf '\n%sInstalled tool summary%s\n' "$C_BOLD" "$C_RESET"
   local t path
-  for t in git curl wget jq tree rg fd fzf tmux htop g++ make cmake uv conda qgpu; do
+  local -a tools=(git curl wget jq tree rg fd fzf tmux htop g++ make cmake uv conda)
+  # qgpu installs into the user prefix only; root mode skips it, so do not report it missing.
+  [[ "$MODE" == "root" ]] || tools+=(qgpu)
+  for t in "${tools[@]}"; do
     if path="$(tool_path "$t")"; then
       printf '  %s%-6s%s %s\n' "$C_GREEN" "$t" "$C_RESET" "$path"
     else

@@ -92,8 +92,12 @@ do_remove() {
     info "no launcher at $LAUNCHER"
   fi
   if [[ -d "$PREFIX" ]]; then
-    run rm -rf "$PREFIX"
-    info "removed code dir $PREFIX"
+    if [[ "$(cd "$PREFIX" && pwd)" == "$SRC_DIR" ]]; then
+      warn "$PREFIX is the source tree; leaving it alone"
+    else
+      run rm -rf "$PREFIX"
+      info "removed code dir $PREFIX"
+    fi
   fi
   info "runtime state left untouched; delete it manually if you want a clean slate:"
   info "  \${QGPU_HOME:-\$XDG_STATE_HOME/qgpu}  (default ~/.local/state/qgpu)"
@@ -123,7 +127,17 @@ do_install() {
         "${SRC_DIR}/${file}" "${PREFIX}/${file}"
     done
   fi
-  run ln -sfn "${PREFIX}/qgpu" "$LAUNCHER"
+  if [[ -e "$LAUNCHER" && ! -L "$LAUNCHER" ]]; then
+    warn "$LAUNCHER exists and is not a symlink; leaving it alone (move it away, then re-run)"
+  else
+    if [[ -L "$LAUNCHER" ]]; then
+      local current
+      current="$(readlink -f "$LAUNCHER" 2>/dev/null || true)"
+      [[ -z "$current" || "$current" == "${PREFIX}/qgpu" ]] ||
+        info "replacing symlink $LAUNCHER (was -> $current)"
+    fi
+    run ln -sfn "${PREFIX}/qgpu" "$LAUNCHER"
+  fi
 
   printf '\n'
   log "done"
