@@ -170,6 +170,18 @@ source ~/Mihomo/proxy-env.sh
 git config --global http.https://github.com/.proxy http://127.0.0.1:17890
 ```
 
+`mihomoctl start` 只在代理真正开始监听后才报成功。如果端口已被占用——共享服务器上
+别人已经在 17890 跑了一个代理，这是常见情况——它会停掉这个半死的进程、打印原因和
+日志路径，并以非零退出码结束，而不是假装启动成功：
+
+```
+mihomo start FAILED: port 17890 is already in use by another process
+  hint: stop the process using 127.0.0.1:17890, or re-run install-mihomo.sh with a different --port
+```
+
+`mihomoctl status` 遵循同一规则：进程活着但端口没在监听时，报告
+`mihomo NOT working`（退出码 1）。多人共用一台机器时，请用 `--port` 选一个空闲端口。
+
 ## tools
 
 只读看板。通用参数：
@@ -215,6 +227,12 @@ tools/docker-board.sh CONTAINER     # 单个容器的详细信息
 
 展示容器状态、CPU / 内存，以及推断出的宿主 `OWNER`（Docker 不记录谁启动的容器，
 owner 由 Compose 工作目录和 bind mount 路径推断）。默认隐藏 Harbor 网络 sidecar。
+
+采集是批量做的：无论有多少容器，只调用一次 `docker ps`、一次 `docker ps -a`、
+一次 `docker stats` 和一次批量 `docker inspect`。因此在繁忙的共享宿主上从“分钟级”
+变成“秒级”——实测 716 个运行中容器：93s → 9.6s；`--all` 覆盖 3019 个容器时：
+340s → 14s。剩下的耗时来自 `docker stats --no-stream` 本身，所以在 700 容器的
+宿主上 `-w 2` 的实际刷新周期由它决定（约 10s），而不是由间隔参数决定。
 
 ### install-aliases.sh
 

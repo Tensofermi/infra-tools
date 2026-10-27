@@ -175,6 +175,20 @@ source ~/Mihomo/proxy-env.sh
 git config --global http.https://github.com/.proxy http://127.0.0.1:17890
 ```
 
+`mihomoctl start` only reports success once the proxy is really listening. If the
+mixed port is already taken — common on a shared server where another account
+already runs a proxy on 17890 — it stops the half-dead process, prints the
+reason and the log path, and exits non-zero instead of claiming success:
+
+```
+mihomo start FAILED: port 17890 is already in use by another process
+  hint: stop the process using 127.0.0.1:17890, or re-run install-mihomo.sh with a different --port
+```
+
+`mihomoctl status` follows the same rule: a live pid whose port is not listening
+is reported as `mihomo NOT working` (exit 1). Pick a free port with `--port`
+when several people share one machine.
+
 ## tools
 
 Read-only dashboards. Common flags:
@@ -223,6 +237,14 @@ Shows container state, CPU / memory and an inferred host `OWNER` (Docker does
 not record who ran a container; the owner is inferred from Compose working
 directories and bind-mount paths). Harbor network sidecars are hidden by
 default.
+
+Collection is batched: one `docker ps`, one `docker ps -a`, one `docker stats`
+and a single bulk `docker inspect`, no matter how many containers exist. A busy
+shared host therefore renders in seconds instead of minutes — measured on 716
+running containers: 93s → 9.6s, and with `--all` over 3019 containers: 340s →
+14s. What is left is `docker stats --no-stream` sampling itself, so a `-w 2`
+refresh cycle on a 700-container host is bounded by that (~10s), not by the
+interval.
 
 ### install-aliases.sh
 
