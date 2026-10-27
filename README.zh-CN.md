@@ -26,6 +26,13 @@ tools/              只读终端看板
   install-aliases.sh  为看板安装 shell 别名（.bashrc / .zshrc）
 tools/lib/
   platform.sh         Linux + macOS 可移植层（被看板 source）
+monitor/             cron 驱动的节点监控：采样、归档、本地看板
+  bin/collect.py      一次采样：GPU、进程、CPU、内存、磁盘
+  bin/archive.py      每日汇总、采样缺口、超期转 .gz
+  bin/dashboard.py    127.0.0.1:8899 上的只读看板
+  install.sh          装到 ~/gpu-monitor，可选写入 crontab
+  docs/schema.md      稳定的样本字段契约
+  README.md           完整使用手册
 qgpu/               自完备的 GPU 作业队列（Python 3 标准库 + nvidia-smi）
   qgpu.py             命令行：submit / list / show / logs / cancel / start / stop
   scheduler.py        后台调度器：寻找空闲卡并启动作业
@@ -44,6 +51,7 @@ qgpu/               自完备的 GPU 作业队列（Python 3 标准库 + nvidia-
 | `tools/gpu-board.sh` | 支持（需 `nvidia-smi`） | 不适用（无 NVIDIA `nvidia-smi`） |
 | `tools/docker-board.sh` | 支持 | 支持（Docker Desktop） |
 | `tools/install-aliases.sh` | 支持 | 支持 |
+| `monitor/` | 支持（需 `python3`；GPU 字段需 `nvidia-smi`） | 支持（GPU 字段为 `null`） |
 | `qgpu/` | 支持（需 `python3` + `nvidia-smi`） | 不适用（无 NVIDIA `nvidia-smi`） |
 
 架构：`x86_64` / `amd64` 与 `aarch64` / `arm64`。
@@ -77,6 +85,7 @@ sudo ./install-fast/install-root.sh
 | `dev` | g++ / build-essential、make、gdb、cmake、ninja、pkg-config |
 | `python` | uv + conda（Miniforge，自带 `mamba`） |
 | `qgpu` | 个人 GPU 作业队列命令行（见下文） |
+| `monitor` | cron 驱动的节点监控 + 本地看板（见下文） |
 
 参数：
 
@@ -222,6 +231,43 @@ tools/install-aliases.sh --remove   # 移除别名
 重新运行即可刷新路径，其余 shell 配置不会被改动。安装后开一个新终端（或
 `source ~/.bashrc`）即可使用。
 
+## monitor
+
+`tools/gpu-board.sh` 回答“此刻在发生什么”；`monitor/` 回答“过去 24 小时发生了什么”，
+而且把答案留在了磁盘上：cron 每分钟采样一次、每日归档、一个只读网页看板。
+纯标准库，无数据库，无守护进程。
+
+本目录是原独立仓库 [`gpu-monitor`](https://github.com/Tensofermi/gpu-monitor)
+的归档位置（该仓库已并入 infra-tools）。
+
+```bash
+./monitor/install.sh gpu-01           # 装到 ~/gpu-monitor
+./monitor/install.sh gpu-01 --cron    # 顺便写入 crontab（幂等）
+
+~/gpu-monitor/collect.sh              # 立刻采一个样
+~/gpu-monitor/status.sh               # 一行摘要
+~/gpu-monitor/dashboard-start.sh      # http://127.0.0.1:8899/
+```
+
+远端机器：先 `ssh -L 8899:127.0.0.1:8899 <host>`，再在本机浏览器打开
+`http://127.0.0.1:8899/`。看板默认只监听回环地址。
+
+```
+cron(每分钟) ─→ collect.py ─→ data/samples/<UTC 日>.jsonl
+                             data/latest.json
+cron(每天)   ─→ archive.py ─→ data/archives/<日>.summary.json
+手动          ─→ dashboard.py ─→ 127.0.0.1:8899
+```
+
+选项：`--cron`、`--prefix DIR`、`--retention DAYS`、`--dry-run`、`--help`。
+配置是 `~/gpu-monitor/env` 里的环境变量（`MONITOR_MACHINE`、`MONITOR_HOME`、
+`MONITOR_DATA_DIR`、`MONITOR_RETENTION_DAYS`、`MONITOR_HOST`、`MONITOR_PORT`）。
+
+读不到的值一律写 `null` 而不是 `0`；采样缺口如实记录而不插值；进程命令行落盘前先脱敏。
+完整手册、样本 schema 以及从旧 `gpu-monitor` 布局迁移的步骤见
+[`monitor/README.md`](./monitor/README.md) 与
+[`monitor/docs/schema.md`](./monitor/docs/schema.md)。
+
 ## qgpu
 
 一个自完备的 GPU 作业队列，服务对象正是这些安装器准备的共享服务器。提交命令后，
@@ -275,7 +321,8 @@ qgpu status                                  # 调度器状态 + 每卡概览
 ## 设计原则
 
 - 纯 Bash、依赖极少，读看板不需要 root。
-- 可选组件（`qgpu`）保持自完备：只用标准库、私有状态目录，可整体卸载而不污染宿主。
+- 可选组件（`qgpu`、`monitor`）保持自完备：只用标准库、私有状态目录（不在仓库内），
+  可整体卸载而不污染宿主。
 - 检测平台与包管理器，而不是假设某个发行版。
 - 优雅降级 —— 打印清晰的“此处不支持”，而不是报错。
 - 安装器幂等；托管配置块不会覆盖你的原有配置。

@@ -28,6 +28,13 @@ tools/              read-only terminal dashboards
   install-aliases.sh  install shell aliases for the boards (.bashrc / .zshrc)
 tools/lib/
   platform.sh         Linux + macOS portability shim (sourced by the boards)
+monitor/            cron-driven node monitor: samples, archives, local dashboard
+  bin/collect.py      one sample: GPUs, processes, CPU, memory, disks
+  bin/archive.py      daily summaries, coverage gaps, rotation to .gz
+  bin/dashboard.py    read-only web view on 127.0.0.1:8899
+  install.sh          install into ~/gpu-monitor, optional crontab lines
+  docs/schema.md      stable sample field contract
+  README.md           full manual
 qgpu/               self-contained GPU job queue (Python 3 stdlib + nvidia-smi)
   qgpu.py             CLI: submit / list / show / logs / cancel / start / stop
   scheduler.py        background scheduler; finds idle GPUs and launches jobs
@@ -46,6 +53,7 @@ qgpu/               self-contained GPU job queue (Python 3 stdlib + nvidia-smi)
 | `tools/gpu-board.sh` | yes (needs `nvidia-smi`) | n/a (no NVIDIA `nvidia-smi`) |
 | `tools/docker-board.sh` | yes | yes (Docker Desktop) |
 | `tools/install-aliases.sh` | yes | yes |
+| `monitor/` | yes (needs `python3`; GPU fields need `nvidia-smi`) | yes (GPU fields stay `null`) |
 | `qgpu/` | yes (needs `python3` + `nvidia-smi`) | n/a (no NVIDIA `nvidia-smi`) |
 
 Architectures: `x86_64` / `amd64` and `aarch64` / `arm64`.
@@ -79,6 +87,7 @@ Groups (default: all):
 | `dev` | g++ / build-essential, make, gdb, cmake, ninja, pkg-config |
 | `python` | uv + conda (Miniforge, includes `mamba`) |
 | `qgpu` | per-user GPU job queue CLI (see below) |
+| `monitor` | cron-driven node monitor + local dashboard (see below) |
 
 Flags:
 
@@ -231,6 +240,46 @@ every run, so re-running after moving the repo refreshes the paths and your
 other shell configuration is never touched. Open a new shell (or
 `source ~/.bashrc`) to use them.
 
+## monitor
+
+`tools/gpu-board.sh` answers "what is happening right now". `monitor/` answers
+"what happened in the last 24 hours", and keeps the answer on disk: one sample a
+minute from cron, daily archives, and a read-only web view. Stdlib only, no
+database, no daemon.
+
+This directory is the archived home of the former
+[`gpu-monitor`](https://github.com/Tensofermi/gpu-monitor) repository.
+
+```bash
+./monitor/install.sh gpu-01           # install into ~/gpu-monitor
+./monitor/install.sh gpu-01 --cron    # also add the cron lines (idempotent)
+
+~/gpu-monitor/collect.sh              # one sample now
+~/gpu-monitor/status.sh               # one-line summary
+~/gpu-monitor/dashboard-start.sh      # http://127.0.0.1:8899/
+```
+
+Remote host: `ssh -L 8899:127.0.0.1:8899 <host>`, then open
+`http://127.0.0.1:8899/` locally. The dashboard binds to loopback on purpose.
+
+```
+cron(1/min) ─→ collect.py ─→ data/samples/<UTC day>.jsonl
+                             data/latest.json
+cron(daily) ─→ archive.py ─→ data/archives/<day>.summary.json
+manual      ─→ dashboard.py ─→ 127.0.0.1:8899
+```
+
+Options: `--cron`, `--prefix DIR`, `--retention DAYS`, `--dry-run`,
+`--help`. Configuration is environment variables in `~/gpu-monitor/env`
+(`MONITOR_MACHINE`, `MONITOR_HOME`, `MONITOR_DATA_DIR`,
+`MONITOR_RETENTION_DAYS`, `MONITOR_HOST`, `MONITOR_PORT`).
+
+A value that could not be read is stored as `null`, never `0`; sampling gaps are
+reported instead of interpolated; process command lines are redacted before they
+touch disk. Full manual, the sample schema and the migration notes for the old
+`gpu-monitor` layout are in [`monitor/README.md`](./monitor/README.md) and
+[`monitor/docs/schema.md`](./monitor/docs/schema.md).
+
 ## qgpu
 
 A self-contained GPU job queue, for the same shared servers the installers
@@ -288,8 +337,8 @@ Full manual: [qgpu/README.md](./qgpu/README.md).
 ## Design principles
 
 - Plain Bash, minimal dependencies, no root required to read a dashboard.
-- Opt-in extras (`qgpu`) stay self-contained: stdlib only, private state dir,
-  removable without touching the host.
+- Opt-in extras (`qgpu`, `monitor`) stay self-contained: stdlib only, private
+  state dir outside the repo, removable without touching the host.
 - Detect the platform and package manager instead of assuming one distro.
 - Degrade — print a clear "not supported here" line rather than failing.
 - Idempotent installers; managed config blocks that do not overwrite yours.

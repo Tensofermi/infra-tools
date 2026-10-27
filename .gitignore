@@ -8,6 +8,14 @@ qgpu/scheduler.log
 qgpu/scheduler.pid
 qgpu/scheduler.lock
 
+# monitor runtime state, if someone points MONITOR_HOME at the repo
+monitor/data/
+monitor/log/
+monitor/*.pid
+monitor/*.lock
+monitor/env
+
 # python bytecode
 __pycache__/
 *.pyc
+

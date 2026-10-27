@@ -12,7 +12,7 @@ DRY_RUN=0
 MIRROR=1
 USE_SUDO=0
 DISABLE_COLOR=0
-SELECTED="base,cli,dev,python,qgpu"
+SELECTED="base,cli,dev,python,qgpu,monitor"
 PKG_MGR=""
 SUDO_CMD=""
 CAN_SYSTEM=0
@@ -20,6 +20,7 @@ CAN_SYSTEM=0
 # install-fast/ lives next to the component directories it can wire up.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 QGPU_SRC="${REPO_ROOT}/qgpu"
+MONITOR_SRC="${REPO_ROOT}/monitor"
 
 case "$MODE" in
   root)
@@ -414,6 +415,26 @@ do_qgpu() {
   fi
 }
 
+do_monitor() {
+  log "node monitor (monitor)"
+  if [[ "$MODE" == "root" ]]; then
+    warn "the node monitor writes per-user history and a user crontab; run ./install-fast/install-user.sh --only monitor"
+    return 0
+  fi
+  local installer="${MONITOR_SRC}/install.sh"
+  if [[ ! -f "$installer" ]]; then
+    warn "monitor/install.sh not found under ${MONITOR_SRC}"
+    return 0
+  fi
+  local -a flags=(--prefix "$HOME/gpu-monitor")
+  ((DRY_RUN)) && flags+=(--dry-run)
+  if ! bash "$installer" "${flags[@]}"; then
+    warn "monitor installer failed (python3 is required); re-run: bash ${installer}"
+    return 0
+  fi
+  info "cron lines are printed above; re-run with --cron to add them: bash ${installer} --cron"
+}
+
 list_groups() {
   cat <<EOF
 Groups:
@@ -422,6 +443,7 @@ Groups:
   dev     g++/build-essential make gdb cmake ninja pkg-config
   python  uv + conda (Miniforge, includes mamba)
   qgpu    qGPU per-user GPU job queue CLI (needs python3 + nvidia-smi)
+  monitor cron-driven node monitor + local dashboard (needs python3)
 EOF
 }
 
@@ -509,6 +531,10 @@ verify() {
       printf '  %s%-6s%s not found\n' "$C_DIM" "$t" "$C_RESET"
     fi
   done
+  # The monitor is a cron-driven collector, not a PATH tool: report its home.
+  if [[ "$MODE" != "root" && -x "${HOME}/gpu-monitor/collect.sh" ]]; then
+    printf '  %s%-6s%s %s\n' "$C_GREEN" "monitor" "$C_RESET" "${HOME}/gpu-monitor"
+  fi
 }
 
 # ------------------------------------------------------------------- main ----
@@ -521,7 +547,7 @@ Usage: ${prog} [options]
 One-shot installer for a fresh dev/GPU server. Idempotent: safe to re-run.
 
 Options:
-      --only GROUPS     Comma list: base,cli,dev,python,qgpu (default: all)
+      --only GROUPS     Comma list: base,cli,dev,python,qgpu,monitor (default: all)
       --skip GROUPS     Remove groups from the default set
       --dry-run         Print actions without changing anything
       --no-mirror       Do not write pip/uv/conda/HF China mirrors
@@ -587,7 +613,7 @@ main() {
   for g in "${_groups[@]}"; do
     case "$g" in
       "") ;;
-      base|cli|dev|python|qgpu) "do_$g" ;;
+      base|cli|dev|python|qgpu|monitor) "do_$g" ;;
       *) warn "unknown group: $g" ;;
     esac
   done
