@@ -14,13 +14,27 @@ from pathlib import Path
 
 
 def _prescan_home() -> None:
-    """在 import common 之前处理 --home，使状态目录可以在本次调用内改变。"""
+    """在 import common 之前处理 --home，使状态目录可以在本次调用内改变。
+
+    只解析子命令之前的全局选项。子命令之后的参数，尤其是 `--` 之后的作业命令，
+    必须原样交给作业：`qgpu submit -- python train.py --home /data` 里的 --home
+    属于训练脚本，不能改动 qGPU 自己的状态目录。
+    """
     argv = sys.argv[1:]
-    for position, item in enumerate(argv):
-        if item == "--home" and position + 1 < len(argv):
+    position = 0
+    while position < len(argv):
+        item = argv[position]
+        if item == "--" or not item.startswith("-"):
+            return  # 到达子命令或 `--`，后面全部属于子命令/作业
+        if item == "--home":
+            if position + 1 >= len(argv):
+                return
             os.environ["QGPU_HOME"] = argv[position + 1]
-        elif item.startswith("--home="):
+            position += 2
+            continue
+        if item.startswith("--home="):
             os.environ["QGPU_HOME"] = item.split("=", 1)[1]
+        position += 1
 
 
 _prescan_home()
@@ -515,9 +529,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="qgpu",
         description="qGPU：任意数量 NVIDIA GPU 上的个人作业队列",
-        epilog=f"状态目录默认 {HOME}（可用 --home 或 QGPU_HOME 覆盖）",
+        epilog=(
+            f"状态目录默认 {HOME}（可用 --home DIR 或 QGPU_HOME 覆盖；"
+            "--home 是全局选项，需放在子命令之前）"
+        ),
     )
-    parser.add_argument("--home", metavar="DIR", help="状态目录（数据库/配置/日志）")
+    parser.add_argument(
+        "--home",
+        metavar="DIR",
+        help="状态目录（数据库/配置/日志）；需放在子命令之前",
+    )
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
     sub.add_parser("start", help="启动调度器").set_defaults(func=start_scheduler)

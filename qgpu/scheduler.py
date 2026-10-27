@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 from common import (
+    DEFAULT_CONFIG,
     HOME,
     LOCK_PATH,
     PID_PATH,
@@ -189,6 +190,7 @@ def run_daemon() -> int:
     signal.signal(signal.SIGINT, stop_handler)
     connection = connect()
     write_daemon_log(f"qGPU 调度器启动，pid={os.getpid()}，状态目录={HOME}")
+    poll_seconds = float(DEFAULT_CONFIG["poll_seconds"])
     try:
         while not stopping:
             try:
@@ -197,7 +199,11 @@ def run_daemon() -> int:
                 write_daemon_log(f"GPU 暂不可用，等待下一轮：{exc}")
             except Exception as exc:  # 调度器不能因一次 nvidia-smi 或作业错误退出。
                 write_daemon_log(f"调度循环错误：{exc}")
-            time.sleep(load_config()["poll_seconds"])
+            try:
+                poll_seconds = float(load_config()["poll_seconds"])
+            except Exception as exc:  # config.json 被写坏时沿用上一轮的值，别退出。
+                write_daemon_log(f"读取 poll_seconds 失败，沿用 {poll_seconds}s：{exc}")
+            time.sleep(poll_seconds)
     finally:
         PID_PATH.unlink(missing_ok=True)
         connection.close()
