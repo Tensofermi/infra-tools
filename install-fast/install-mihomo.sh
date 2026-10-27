@@ -117,50 +117,281 @@ write_mihomoctl() {
   cat > "$file" <<'EOF'
 #!/usr/bin/env bash
 # Control script for the mihomo instance in this directory.
+#
+# start only reports success once the proxy is really listening: it watches the
+# new lines of mihomo.log for bind errors, the process itself (zombies count as
+# dead) and, when ss/lsof/netstat exist, the mixed-port from config.yaml.
 set -eu
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$DIR/mihomo"
 PIDFILE="$DIR/mihomo.pid"
 LOGFILE="$DIR/mihomo.log"
+CONFIG="$DIR/config.yaml"
+# Filled in by port_listening: listening | down | unknown (no probe tool).
+PORT_STATE="unknown"
 umask 077
 
-running() {
-  [[ -f "$PIDFILE" ]] || return 1
-  local pid
-  read -r pid < "$PIDFILE"
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# alive PID: the process exists and is not an unreaped zombie.
+alive() {
+  local pid="$1" state
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  kill -0 "$pid" 2>/dev/null
+  kill -0 "$pid" 2>/dev/null || return 1
+  if have ps; then
+    state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')"
+    case "$state" in
+      ''|Z*) return 1 ;;
+    esac
+  fi
+  return 0
+}
+
+running() {
+  local pid
+  [[ -f "$PIDFILE" ]] || return 1
+  pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+  alive "$pid"
+}
+
+# Mixed port declared in config.yaml; empty when absent or not a plain number.
+config_port() {
+  local line
+  [[ -f "$CONFIG" ]] || return 0
+  line="$(grep -E '^[[:space:]]*mixed-port:[[:space:]]*[0-9]+' "$CONFIG" 2>/dev/null | head -n 1 || true)"
+  [[ -n "$line" ]] || return 0
+  line="$(printf '%s' "${line##*:}" | tr -dc '0-9')"
+  case "$line" in
+    *[1-9]*) printf '%s\n' "$line" ;;
+  esac
+  return 0
+}
+
+# Local listening addresses, one per line, when any port tool exists.
+listen_addrs() {
+  if have ss; then
+    ss -ltn 2>/dev/null | awk 'NR > 1 { print $4 }'
+  elif have lsof; then
+    lsof -nP -iTCP -sTCP:LISTEN -F n 2>/dev/null | sed -n 's/^n//p'
+  elif have netstat; then
+    netstat -an 2>/dev/null | awk '$NF == "LISTEN" { print $4 }'
+  else
+    return 2
+  fi
+}
+
+# port_busy PORT: 0 when something already listens on PORT on loopback or on
+# every address, which is what a mixed-port bind would collide with.
+port_busy() {
+  local port="$1" addrs
+  case "$port" in ''|*[!0-9]*) return 1 ;; esac
+  addrs="$(listen_addrs)" || return 1
+  [[ -n "$addrs" ]] || return 1
+  printf '%s\n' "$addrs" | awk -v p="$port" '
+    {
+      n = split($1, a, /[.:]/)
+      if (a[n] != p) next
+      addr = substr($1, 1, length($1) - length(a[n]) - 1)
+      if (addr == "*" || addr == "" || addr == "0.0.0.0" || addr == "::" ||
+          addr == "[::]" || addr == "[::1]" || addr ~ /^127\./) found = 1
+    }
+    END { exit found ? 0 : 1 }'
+}
+
+# port_listening PORT: 0 = listening, 1 = not listening, 2 = no probe tool.
+port_listening() {
+  local port="$1" out
+  PORT_STATE="unknown"
+  case "$port" in ''|*[!0-9]*) return 2 ;; esac
+  if have ss && out="$(ss -ltn 2>/dev/null)"; then
+    if printf '%s\n' "$out" |
+      awk -v p="$port" '{ n = split($4, a, ":"); if (a[n] == p) found = 1 } END { exit found ? 0 : 1 }'; then
+      PORT_STATE="listening"
+      return 0
+    fi
+    PORT_STATE="down"
+    return 1
+  fi
+  if have lsof; then
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+      PORT_STATE="listening"
+      return 0
+    fi
+    PORT_STATE="down"
+    return 1
+  fi
+  if have netstat; then
+    if netstat -an 2>/dev/null | grep -E "[.:]${port}[[:space:]].*LISTEN" >/dev/null 2>&1; then
+      PORT_STATE="listening"
+      return 0
+    fi
+    PORT_STATE="down"
+    return 1
+  fi
+  return 2
+}
+
+log_offset() {
+  if [[ -f "$LOGFILE" ]]; then
+    wc -l < "$LOGFILE" | tr -dc '0-9'
+  else
+    printf '0'
+  fi
+}
+
+log_since() {
+  local from="${1:-0}"
+  [[ -f "$LOGFILE" ]] || return 0
+  tail -n "+$((from + 1))" "$LOGFILE" 2>/dev/null || true
+}
+
+# Newest bind/startup error line written after offset OFF; fails when none.
+# Controller-only bind errors are ignored: they do not stop the proxy.
+log_error_since() {
+  local from="${1:-0}" text
+  text="$(log_since "$from" |
+    grep -E 'address already in use|bind: |permission denied|cannot assign requested address' |
+    grep -v -i 'controller' |
+    tail -n 1 || true)"
+  [[ -n "$text" ]] || return 1
+  printf '%s\n' "$text"
+}
+
+port_hint() {
+  local port="$1"
+  if [[ -n "$port" ]]; then
+    printf 'stop the process using 127.0.0.1:%s, or re-run install-mihomo.sh with a different --port' "$port"
+  else
+    printf 'stop the process already using the proxy port, or re-run install-mihomo.sh with a different --port'
+  fi
+}
+
+# Reap a half-dead instance, drop the pidfile and report the failure on stderr.
+start_failed() {
+  local pid="$1" detail="$2" hint="$3" i=0
+  if [[ -n "$pid" ]]; then
+    if alive "$pid"; then
+      kill "$pid" 2>/dev/null || true
+      while alive "$pid" && ((i < 20)); do
+        sleep 0.1
+        i=$((i + 1))
+      done
+      if alive "$pid"; then kill -9 "$pid" 2>/dev/null || true; fi
+    fi
+    wait "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PIDFILE"
+  {
+    printf 'mihomo start FAILED: %s\n' "$detail"
+    printf '  log:  %s\n' "$LOGFILE"
+    printf '  hint: %s\n' "$hint"
+  } >&2
+  return 1
 }
 
 start() {
-  if running; then echo "mihomo running (pid $(cat "$PIDFILE"))"; return 0; fi
-  if ! "$BIN" -t -d "$DIR" >/dev/null 2>&1; then
-    echo "config test failed:"; "$BIN" -t -d "$DIR"; return 1
+  local port pid offset n wait_s deadline errline
+  if running; then
+    echo "mihomo already running (pid $(cat "$PIDFILE"))"
+    return 0
   fi
+  rm -f "$PIDFILE"
+  if ! "$BIN" -t -d "$DIR" >/dev/null 2>&1; then
+    { echo "mihomo start FAILED: config test failed"; "$BIN" -t -d "$DIR"; } >&2
+    return 1
+  fi
+  port="$(config_port)"
+  if [[ -n "$port" ]] && port_busy "$port"; then
+    start_failed "" "port ${port} is already in use by another process" "$(port_hint "$port")"
+    return 1
+  fi
+  offset="$(log_offset)"
   nohup "$BIN" -d "$DIR" >>"$LOGFILE" 2>&1 </dev/null &
-  echo $! > "$PIDFILE"
-  sleep 1
-  running || { echo "start failed: see $LOGFILE"; return 1; }
-  echo "mihomo started (pid $(cat "$PIDFILE"))"
+  pid=$!
+  echo "$pid" > "$PIDFILE"
+  # Wall-clock bound: ~3s to come up when the port is known, 1s otherwise.
+  wait_s=1
+  if [[ -n "$port" ]]; then wait_s=3; fi
+  deadline=$(( $(date +%s) + wait_s ))
+  n=0
+  while ((n < 100)) && (( $(date +%s) < deadline )); do
+    if errline="$(log_error_since "$offset")"; then
+      start_failed "$pid" "the proxy failed to bind: ${errline}" "$(port_hint "$port")"
+      return 1
+    fi
+    if ! alive "$pid"; then
+      if errline="$(log_error_since "$offset")"; then
+        start_failed "$pid" "the proxy failed to bind: ${errline}" "$(port_hint "$port")"
+      else
+        errline="$(log_since "$offset" | grep -v '^[[:space:]]*$' | tail -n 1 || true)"
+        start_failed "$pid" "mihomo exited during startup${errline:+ (last log line: ${errline})}" "check ${LOGFILE}, fix config.yaml and start again"
+      fi
+      return 1
+    fi
+    if [[ -n "$port" ]] && port_listening "$port"; then
+      break
+    fi
+    n=$((n + 1))
+    sleep 0.1
+  done
+  if [[ "$PORT_STATE" == "down" ]]; then
+    start_failed "$pid" "mihomo is running (pid ${pid}) but nothing listens on port ${port}" "$(port_hint "$port")"
+    return 1
+  fi
+  if ! alive "$pid"; then
+    start_failed "$pid" "mihomo exited during startup" "check ${LOGFILE}, fix config.yaml and start again"
+    return 1
+  fi
+  echo "mihomo started (pid ${pid}${port:+, 127.0.0.1:${port}})"
 }
 
 stop() {
+  local pid
   if running; then
-    local pid
-    read -r pid < "$PIDFILE"
-    kill "$pid"
-    for _ in $(seq 1 50); do running || break; sleep 0.1; done
-    running && { echo "mihomo still stopping"; return 1; }
+    pid="$(cat "$PIDFILE")"
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+      alive "$pid" || break
+      sleep 0.1
+    done
+    if alive "$pid"; then
+      kill -9 "$pid" 2>/dev/null || true
+      sleep 0.2
+    fi
+    if alive "$pid"; then echo "mihomo still stopping (pid ${pid})"; return 1; fi
+    wait "$pid" 2>/dev/null || true
   fi
   rm -f "$PIDFILE"
   echo "mihomo stopped"
+}
+
+status() {
+  local pid port i=0
+  if ! running; then echo "mihomo stopped"; return 1; fi
+  pid="$(cat "$PIDFILE")"
+  port="$(config_port)"
+  if [[ -n "$port" ]]; then
+    while ((i < 10)); do
+      if port_listening "$port"; then break; fi
+      if [[ "$PORT_STATE" == "unknown" ]]; then break; fi
+      i=$((i + 1))
+      sleep 0.1
+    done
+    if [[ "$PORT_STATE" == "down" ]]; then
+      echo "mihomo NOT working: pid ${pid} is alive but 127.0.0.1:${port} is not listening (see ${LOGFILE})" >&2
+      return 1
+    fi
+    echo "mihomo running (pid ${pid}, 127.0.0.1:${port})"
+    return 0
+  fi
+  echo "mihomo running (pid ${pid})"
 }
 
 case "${1:-status}" in
   start)   start ;;
   stop)    stop ;;
   restart) stop; start ;;
-  status)  if running; then echo "mihomo running (pid $(cat "$PIDFILE"))"; else echo "mihomo stopped"; exit 1; fi ;;
+  status)  status ;;
   *)       echo "Usage: $0 {start|stop|restart|status}"; exit 2 ;;
 esac
 EOF
@@ -313,7 +544,8 @@ main() {
     if ((DRY_RUN)); then
       info "[dry-run] would run mihomoctl start"
     else
-      "${MIHOMO_DIR}/mihomoctl" start || warn "mihomo did not start; check config.yaml"
+      "${MIHOMO_DIR}/mihomoctl" start ||
+        die "mihomo did not start; fix config.yaml or pick a free --port, then re-run: ${MIHOMO_DIR}/mihomoctl start"
     fi
   fi
 
