@@ -12,7 +12,7 @@ DRY_RUN=0
 MIRROR=1
 USE_SUDO=0
 DISABLE_COLOR=0
-SELECTED="base,cli,dev,python,vcs,qgpu,monitor"
+SELECTED="base,cli,dev,python,vcs,rust,qgpu,monitor"
 PKG_MGR=""
 SUDO_CMD=""
 CAN_SYSTEM=0
@@ -21,6 +21,7 @@ CAN_SYSTEM=0
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 QGPU_SRC="${REPO_ROOT}/qgpu"
 MONITOR_SRC="${REPO_ROOT}/monitor"
+PROXY_SRC="${REPO_ROOT}/proxy"
 
 case "$MODE" in
   root)
@@ -60,6 +61,14 @@ https://mirror.nju.edu.cn/github-release/conda-forge/miniforge/LatestRelease"
 # 兜底版本：GitHub API 取不到 latest 时用（release 资产名里带版本号）。
 GH_CLI_FALLBACK_VERSION="2.103.3"
 GLAB_FALLBACK_VERSION="1.126.0"
+
+# Rust 工具链。rustup 本体在 sh.rustup.rs（国内可直连，30 KB 的脚本），
+# 但真正大的是 dist 里的组件包，国内直连 static.rust-lang.org 很慢，
+# 换成 tuna / ustc / aliyun 的 rustup 镜像（同一套 dist 目录结构）。
+RUSTUP_DIST_MIRRORS_DEFAULT="https://mirrors.tuna.tsinghua.edu.cn/rustup
+https://mirrors.ustc.edu.cn/rust-static
+https://mirrors.aliyun.com/rustup"
+CARGO_REGISTRY_MIRROR_DEFAULT="https://rsproxy.cn/index"
 
 # ---------------------------------------------------------------- logging ----
 
@@ -612,6 +621,85 @@ install_glab_binary() {
   fi
 }
 
+# -------------------------------------------------------------------- rust ---
+# rustup 装到 ~/.rustup + ~/.cargo（标准位置，不引入自定义环境变量），
+# 二进制在 ~/.cargo/bin，由 write_profile() 的托管块加进 PATH。
+
+install_rust() {
+  if have rustc && have cargo; then
+    info "rust already installed ($(rustc --version 2>/dev/null))"
+    return 0
+  fi
+  # BIN_DIR/CONDA 之外的常规位置：rustup 默认的 ~/.cargo/bin（可能还没进 PATH）。
+  if [[ -x "${HOME}/.cargo/bin/rustc" ]]; then
+    info "rust already installed ($("${HOME}/.cargo/bin/rustc" --version 2>/dev/null))"
+    return 0
+  fi
+  local tmp="$(mktemp -d)/rustup-init.sh" m
+  log "installing rust (rustup)"
+  if ! download https://sh.rustup.rs "$tmp"; then
+    warn "rustup-init download failed; 手动装: curl https://sh.rustup.rs -sSf | sh"
+    return 1
+  fi
+  ((DRY_RUN)) && { info "would run rustup-init -y (PATH untouched)"; return 0; }
+
+  # 镜像优先：dist 里的组件包量大，直连 static.rust-lang.org 在国内很慢。
+  # 按顺序逐个试（tuna → ustc → aliyun），都挂了才直连。
+  local -a mirrors=()
+  local ok=0
+  if ((MIRROR)); then
+    while IFS= read -r m; do
+      [[ -n "$m" ]] && mirrors+=("$m")
+    done <<<"${RUSTUP_DIST_MIRRORS:-$RUSTUP_DIST_MIRRORS_DEFAULT}"
+  fi
+
+  # --no-modify-path：PATH 统一由托管的 .bashrc 块管理，不让 rustup 改 shell 配置。
+  for m in ${mirrors[@]+"${mirrors[@]}"}; do
+    log "rust dist 镜像: $(printf '%s' "$m" | cut -d/ -f3)"
+    if env RUSTUP_DIST_SERVER="$m" RUSTUP_UPDATE_ROOT="${m%/}/rustup" \
+        sh "$tmp" -y --no-modify-path --profile default --default-toolchain stable >/dev/null 2>&1; then
+      ok=1
+      break
+    fi
+    warn "镜像 $(printf '%s' "$m" | cut -d/ -f3) 失败，试下一个"
+  done
+
+  if ((!ok)); then
+    ((MIRROR)) && warn "rustup-init 走镜像全部失败，直连重试一次"
+    if ! sh "$tmp" -y --no-modify-path --profile default --default-toolchain stable; then
+      warn "rust install failed; 手动装: curl https://sh.rustup.rs -sSf | sh"
+      return 1
+    fi
+  fi
+  rm -rf "${tmp%/*}"
+  configure_cargo_mirror
+  if [[ -x "${HOME}/.cargo/bin/rustc" ]]; then
+    log "installed $(PATH="${HOME}/.cargo/bin:$PATH" rustc --version 2>/dev/null)"
+  fi
+}
+
+# crates.io 的 sparse 索引：国内 rsproxy 快一个数量级。
+# 只写不存在的 config.toml，用户自己配过的一律不动。
+configure_cargo_mirror() {
+  ((MIRROR)) || return 0
+  [[ "$MODE" == root ]] && return 0
+  local cfg="${HOME}/.cargo/config.toml" url="${CARGO_REGISTRY_MIRROR:-$CARGO_REGISTRY_MIRROR_DEFAULT}"
+  if [[ -f "$cfg" ]]; then
+    info "keeping existing $cfg"
+    return 0
+  fi
+  ((DRY_RUN)) && { info "[dry-run] would write $cfg"; return 0; }
+  mkdir -p "${cfg%/*}"
+  cat > "$cfg" <<EOF
+[source.crates-io]
+replace-with = "mirror"
+
+[source.mirror]
+registry = "sparse+${url}/"
+EOF
+  info "cargo 索引镜像 -> ${url}"
+}
+
 # ---------------------------------------------------------------- groups -----
 
 install_group_pkgs() {
@@ -672,6 +760,15 @@ do_vcs() {
   fi
 }
 
+do_rust() {
+  log "rust toolchain (rustup)"
+  if [[ "$MODE" == root ]]; then
+    warn "rustup installs per-user (~/.cargo, ~/.rustup); run ./install-fast/install-user.sh --only rust"
+    return 0
+  fi
+  install_rust
+}
+
 do_qgpu() {
   log "qGPU job queue (qgpu)"
   if [[ "$MODE" == "root" ]]; then
@@ -711,6 +808,43 @@ do_monitor() {
   info "cron lines are printed above; re-run with --cron to add them: bash ${installer} --cron"
 }
 
+do_proxy() {
+  log "mihomo proxy CLI (proxy)"
+  local installer="${PROXY_SRC}/install.sh"
+  if [[ ! -f "$installer" ]]; then
+    warn "proxy/install.sh not found under ${PROXY_SRC}"
+    return 0
+  fi
+  local -a flags
+  # Same lookup as the CLI itself: MIHOMO_DIR > recorded instance dir > ~/Mihomo.
+  # Without this, a user who installed with --dir /data/mihomo would get the CLI
+  # pointed at ~/Mihomo, where config.yaml does not exist.
+  local dir="${MIHOMO_DIR:-}" marker
+  if [[ -z "$dir" ]]; then
+    marker="${XDG_CONFIG_HOME:-${HOME}/.config}/infra-tools/mihomo-dir"
+    [[ -r "$marker" ]] && IFS= read -r dir <"$marker"
+    dir="${dir:-${HOME}/Mihomo}"
+  fi
+  [[ "$MODE" == "root" && -z "${MIHOMO_DIR:-}" ]] && dir="/etc/mihomo"
+  if [[ "$MODE" == "root" ]]; then
+    # The CLI is usable by anyone, but `proxy on` needs a per-user shell block;
+    # writing it into /etc/profile.d would only cover login shells.
+    flags=(--prefix "$dir" --bin-dir "$BIN_DIR" --no-rc)
+  else
+    flags=(--prefix "$dir" --bin-dir "$BIN_DIR")
+  fi
+  ((DRY_RUN)) && flags+=(--dry-run)
+  if ! bash "$installer" "${flags[@]}"; then
+    warn "proxy installer failed (needs bash + curl + python3); re-run: bash ${installer}"
+    return 0
+  fi
+  if [[ "$MODE" == "root" ]]; then
+    info "root mode: launcher only; run ${installer} from your own account to get \`proxy on\`"
+  else
+    info "open a new shell, then: proxy on   (mihomo itself: bash install-fast/install-mihomo.sh)"
+  fi
+}
+
 list_groups() {
   cat <<EOF
 Groups:
@@ -719,8 +853,10 @@ Groups:
   dev     g++/build-essential make gdb cmake ninja pkg-config
   python  uv + conda (Miniforge, includes mamba)
   vcs     gh (GitHub CLI) + glab (GitLab CLI), installed into BIN_DIR
+  rust    rustup + stable toolchain (cargo, rustfmt, clippy) into ~/.cargo
   qgpu    qGPU per-user GPU job queue CLI (needs python3 + nvidia-smi)
   monitor cron-driven node monitor + local dashboard (needs python3)
+  proxy   mihomo proxy CLI: on/off/status/pick/nodes (needs curl + python3)
 EOF
 }
 
@@ -733,7 +869,7 @@ write_profile() {
     info "[dry-run] would write managed block to $PROFILE_FILE"
     return 0
   fi
-  local start="# >>> install-fast >>>" end="# <<< install-fast >>>" tmp
+  local start="# >>> install-fast >>>" end="# <<< install-fast >>>" tmp out dir m
   tmp="$(mktemp)"
   if [[ -f "$PROFILE_FILE" ]]; then
     awk -v s="$start" -v e="$end" '
@@ -742,8 +878,10 @@ write_profile() {
       !skip { print }
     ' "$PROFILE_FILE" > "$tmp"
   fi
-  local dir="${PROFILE_FILE%/*}"
+  dir="${PROFILE_FILE%/*}"
   [[ -d "$dir" ]] || mkdir -p "$dir"
+  # 原子替换：写到同目录临时文件再 mv，中途失败不会留下半截 rc。
+  out="$(mktemp "${PROFILE_FILE}.XXXXXX")"
   {
     cat "$tmp"
     printf '%s\n' "$start"
@@ -751,10 +889,16 @@ write_profile() {
     if [[ -d "$CONDA_PREFIX/bin" ]]; then
       printf 'export PATH="%s:$PATH"\n' "$CONDA_PREFIX/bin"
     fi
+    if [[ "$MODE" != root && -d "${HOME}/.cargo/bin" ]]; then
+      printf 'export PATH="%s:$PATH"\n' "${HOME}/.cargo/bin"
+    fi
     ((MIRROR)) && printf 'export UV_DEFAULT_INDEX="https://pypi.tuna.tsinghua.edu.cn/simple"\n'
     ((MIRROR)) && printf 'export HF_ENDPOINT="https://hf-mirror.com"\n'
     printf '%s\n' "$end"
-  } > "$PROFILE_FILE"
+  } > "$out"
+  m="$(stat -c %a "$PROFILE_FILE" 2>/dev/null || stat -f %Lp "$PROFILE_FILE" 2>/dev/null || true)"
+  chmod "${m:-644}" "$out" 2>/dev/null || true
+  mv -f "$out" "$PROFILE_FILE"
   rm -f "$tmp"
 }
 
@@ -791,6 +935,7 @@ tool_path() {
   local t="$1"
   if have "$t"; then command -v "$t"; return; fi
   if [[ -x "$CONDA_PREFIX/bin/$t" ]]; then printf '%s' "$CONDA_PREFIX/bin/$t"; return; fi
+  if [[ -x "${HOME}/.cargo/bin/$t" ]]; then printf '%s' "${HOME}/.cargo/bin/$t"; return; fi
   if [[ -x "$BIN_DIR/$t" ]]; then printf '%s' "$BIN_DIR/$t"; return; fi
   return 1
 }
@@ -798,7 +943,7 @@ tool_path() {
 verify() {
   printf '\n%sInstalled tool summary%s\n' "$C_BOLD" "$C_RESET"
   local t path
-  local -a tools=(git curl wget jq tree rg fd fzf tmux htop g++ make cmake uv conda gh glab)
+  local -a tools=(git curl wget jq tree rg fd fzf tmux htop g++ make cmake uv conda gh glab proxy rustc cargo)
   # qgpu installs into the user prefix only; root mode skips it, so do not report it missing.
   [[ "$MODE" == "root" ]] || tools+=(qgpu)
   for t in "${tools[@]}"; do
@@ -824,7 +969,8 @@ Usage: ${prog} [options]
 One-shot installer for a fresh dev/GPU server. Idempotent: safe to re-run.
 
 Options:
-      --only GROUPS     Comma list: base,cli,dev,python,vcs,qgpu,monitor (default: all)
+      --only GROUPS     Comma list: base,cli,dev,python,vcs,rust,qgpu,monitor,proxy
+                        (default: all but proxy, which install-mihomo.sh installs)
       --skip GROUPS     Remove groups from the default set
       --dry-run         Print actions without changing anything
       --no-mirror       Do not use China mirrors (pip/uv/conda/HF and GitHub)
@@ -899,7 +1045,7 @@ main() {
   for g in "${_groups[@]}"; do
     case "$g" in
       "") ;;
-      base|cli|dev|python|vcs|qgpu|monitor) "do_$g" ;;
+      base|cli|dev|python|vcs|rust|qgpu|monitor|proxy) "do_$g" ;;
       *) warn "unknown group: $g" ;;
     esac
   done

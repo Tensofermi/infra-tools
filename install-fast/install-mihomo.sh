@@ -429,6 +429,24 @@ EOF
   chmod 0600 "$file"
 }
 
+# The `proxy` CLI (repo: proxy/) is the everyday layer on top of mihomoctl:
+# start, pick a node that really moves bytes, and export the environment into
+# the current shell. It comes from this repo, so the two stay in sync.
+install_proxy_cli() {
+  local installer="${REPO_ROOT}/proxy/install.sh"
+  if [[ ! -f "$installer" ]]; then
+    info "proxy/install.sh not found under ${REPO_ROOT}; skipping the proxy CLI"
+    return 0
+  fi
+  log "installing the proxy CLI (proxy on|off|status)"
+  local -a flags=(--prefix "$MIHOMO_DIR")
+  # Root mode has no per-user rc to wire; the launcher alone is still useful.
+  [[ "$MODE" == "root" ]] && flags+=(--no-rc)
+  ((DRY_RUN)) && flags+=(--dry-run)
+  bash "$installer" "${flags[@]}" ||
+    warn "proxy CLI install failed; re-run: bash ${installer} --prefix ${MIHOMO_DIR}"
+}
+
 write_service() {
   ((WITH_SERVICE)) || return 0
   local unit
@@ -538,6 +556,7 @@ main() {
   write_config_template
   write_proxy_env
   write_mihomoctl
+  install_proxy_cli
   write_service
 
   if ((START_AFTER)); then
@@ -551,6 +570,9 @@ main() {
 
   printf '\n%sDone.%s ' "$C_GREEN" "$C_RESET"
   printf 'Next:\n  source %s/proxy-env.sh\n  %s/mihomoctl start\n' "$MIHOMO_DIR" "$MIHOMO_DIR"
+  if [[ -x "${MIHOMO_DIR}/proxy" ]]; then
+    printf ' or, one step for all of the above (start + pick a node + export the env):\n  proxy on\n'
+  fi
   printf 'For git over this proxy:\n  git config --global http.https://github.com/.proxy http://127.0.0.1:%s\n' "$MIXED_PORT"
 }
 
