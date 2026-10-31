@@ -40,6 +40,11 @@ qgpu/               自完备的 GPU 作业队列（Python 3 标准库 + nvidia-
   install.sh          复制到私有目录并在 PATH 上放 `qgpu` 启动器
   qgpu, run.sh, stop.sh  直接跑仓库内代码用的启动脚本
   README.md           完整使用手册
+proxy/              本地 mihomo 实例的 `proxy on|off|status` 命令行
+  proxy               控制命令：on / off / status / pick / nodes / test / update
+  proxy-shell.sh      shell 集成层（环境变量必须 eval，不能靠子进程）
+  install.sh          装到 mihomo 目录 + 启动器 + 受管理的 rc 区块
+  README.md           完整使用手册
 ```
 
 ## 平台支持
@@ -53,6 +58,7 @@ qgpu/               自完备的 GPU 作业队列（Python 3 标准库 + nvidia-
 | `tools/install-aliases.sh` | 支持 | 支持 |
 | `monitor/` | 支持（需 `python3`；GPU 字段需 `nvidia-smi`） | 支持（GPU 字段为 `null`） |
 | `qgpu/` | 支持（需 `python3` + `nvidia-smi`） | 不适用（无 NVIDIA `nvidia-smi`） |
+| `proxy/` | 支持（需 `bash` + `curl` + `python3`） | 支持（同上；mihomo 有 darwin 版） |
 
 架构：`x86_64` / `amd64` 与 `aarch64` / `arm64`。
 
@@ -85,8 +91,10 @@ sudo ./install-fast/install-root.sh
 | `dev` | g++ / build-essential、make、gdb、cmake、ninja、pkg-config |
 | `python` | uv + conda（Miniforge，自带 `mamba`） |
 | `vcs` | gh（GitHub CLI）+ glab（GitLab CLI），装到 `~/.local/bin` |
+| `rust` | rustup + stable 工具链（cargo、rustfmt、clippy），装到 `~/.cargo` |
 | `qgpu` | 个人 GPU 作业队列命令行（见下文） |
 | `monitor` | cron 驱动的节点监控 + 本地看板（见下文） |
+| `proxy` | mihomo 控制命令行 `proxy on/off/status`，默认不装，需显式 `--only proxy`（见下文） |
 
 参数：
 
@@ -137,7 +145,25 @@ gh auth login        # 每个账户只需一次
 
 登录**故意不做自动化**：凭据属于个人，不该由共享服务器上的安装器代管。
 
-### 3. Agent / harness 安装器
+### 3. Rust 工具链
+
+`--only rust`（包含在默认集合里）把 rustup + stable 工具链装进标准的
+`~/.rustup` 和 `~/.cargo`，纯用户态，不需要 root：
+
+```bash
+./install-fast/install-user.sh --only rust
+~/.cargo/bin/cargo --version   # PATH 由托管块负责添加
+```
+
+- `rustup-init` 从 `sh.rustup.rs` 下载（只有 30 KB，国内可直连）。
+- 组件包走 `tuna` / `ustc` / `aliyun` 的 rustup 镜像（`RUSTUP_DIST_SERVER`），
+  因为 `static.rust-lang.org` 在国内很慢；`--no-mirror` 时走官方源。
+- `~/.cargo/config.toml` 写入 rsproxy 的 crates.io sparse 索引；**已存在就不动**，
+  不会覆盖你自己配的源。
+- 用 `--no-modify-path` 安装，PATH 统一由那一块托管配置管理。
+- C/C++ 编译器**不在**这个组里，属于 `dev` 组（build-essential）。
+
+### 4. Agent / harness 安装器
 
 默认交互式：列出支持的 agent，询问要装哪些，然后安装所选内容。
 
@@ -167,7 +193,7 @@ gh auth login        # 每个账户只需一次
 部分网络下 `fnm.vercel.app` 很慢/被墙，安装器改从 GitHub release 取 fnm 二进制，
 Node 本体走 `npmmirror.com`。
 
-### 4. mihomo 代理安装器
+### 5. mihomo 代理安装器
 
 把 [mihomo](https://github.com/MetaCubeX/mihomo)（Clash Meta）装进一个配置目录，
 并生成控制脚本和 shell 代理环境。
@@ -186,10 +212,21 @@ mihomo         发布二进制
 config.yaml    最小模板，或你的订阅配置
 proxy-env.sh   source 后导出 HTTP(S)_PROXY / ALL_PROXY
 mihomoctl      start | stop | restart | status
+proxy          on | off | status | pick | nodes | test | update   （来自 proxy/）
+proxy-shell.sh `proxy on|off` 的 shell 集成层                     （来自 proxy/）
 ```
 
 参数：`--dir`、`--port`、`--controller-port`、`--config-url`、`--force-config`、
 `--version`、`--proxy`、`--with-service`、`--start`、`--dry-run`、`--no-color`。
+
+安装器会同时把 `proxy` 命令行装到 `mihomoctl` 旁边并接入 `~/.bashrc`
+（详见下文 [proxy](#proxy) 一节），所以日常用法就是：
+
+```bash
+proxy on
+```
+
+不用这个命令行时，手动流程依旧可用：
 
 ```bash
 source ~/Mihomo/proxy-env.sh
@@ -364,11 +401,46 @@ qgpu status                                  # 调度器状态 + 每卡概览
 
 完整手册：[qgpu/README.md](./qgpu/README.md)。
 
+## proxy
+
+`proxy` 是 mihomo 安装器之上的日常使用层：一条命令把 mihomo 启动、挑一个**真正
+能跑流量**的节点，并把 `HTTP(S)_PROXY` 导出到你正在打字的那个 shell。
+
+```bash
+./install-fast/install-user.sh --only proxy   # 安装并接入 ~/.bashrc
+
+proxy on          # 启动 + 挑节点 + 导出环境变量
+proxy status      # VPN / 节点 / 出口 / 当前 shell
+proxy off         # 停掉并清空环境变量
+proxy nodes       # 列出全部节点及实时延迟
+proxy node 3      # 切换主分组（MATCH 走的就是它）
+proxy test        # 节点延迟 + 代理/直连下载速度对比
+```
+
+两个设计要点，都是被坑出来的：
+
+- **节点是实测选出来的，不是只看延迟。** mihomo 的 URLTest 延迟只能证明“这个节点
+  活着”，证明不了它能跑完一次 TLS 握手。候选节点按延迟排序后要真正下载一段数据，
+  再取实际最快的那一个。
+- **环境变量是每个 shell 各自的，而且 `proxy on` 要能证明自己真的成功了。**
+  `on` / `off` 打印 `export` / `unset` 语句，由 `proxy-shell.sh` eval 进当前 shell
+  ——子进程无法修改父进程的环境。现在如果这段输出为空，包装层会直接报错退出，
+  而不是只打印一句“代理已开启”、实际却在直连。
+
+装在 mihomo 实例目录旁（`~/Mihomo`，用 `--prefix` 改），`~/.local/bin` 放启动器，
+并在 `~/.bashrc` / `~/.zshrc` 写一个受管理的 `# >>> infra-tools proxy >>>` 区块；
+`./proxy/install.sh --remove` 可以全部撤掉，`config.yaml`、二进制和缓存都不动。
+
+完整手册：[proxy/README.md](./proxy/README.md)。回归测试（桩 controller，不需要网络和 root）：
+`./proxy/tests/run.sh`。
+
 ## 设计原则
 
 - 纯 Bash、依赖极少，读看板不需要 root。
-- 可选组件（`qgpu`、`monitor`）保持自完备：只用标准库、私有状态目录（不在仓库内），
-  可整体卸载而不污染宿主。
+- 可选组件（`qgpu`、`monitor`、`proxy`）保持自完备：只用标准库、私有状态目录
+  （不在仓库内），可整体卸载而不污染宿主。
+- 任何会改你 shell 的东西（`install-aliases.sh`、`proxy/install.sh`）都写受管理的
+  `>>> ... >>>` 区块，每次重跑都整体替换，重装或卸载都不会碰你原有的配置。
 - 检测平台与包管理器，而不是假设某个发行版。
 - 优雅降级 —— 打印清晰的“此处不支持”，而不是报错。
 - 安装器幂等；托管配置块不会覆盖你的原有配置。

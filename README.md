@@ -42,6 +42,11 @@ qgpu/               self-contained GPU job queue (Python 3 stdlib + nvidia-smi)
   install.sh          copy into a private prefix + `qgpu` launcher on PATH
   qgpu, run.sh, stop.sh  launchers for running straight from the repo
   README.md           full manual
+proxy/              `proxy on|off|status` CLI for a local mihomo instance
+  proxy               control CLI: on / off / status / pick / nodes / test / update
+  proxy-shell.sh      shell integration (the env has to be eval'ed, not spawned)
+  install.sh          install next to mihomo + launcher + managed rc block
+  README.md           full manual
 ```
 
 ## Platform support
@@ -55,6 +60,7 @@ qgpu/               self-contained GPU job queue (Python 3 stdlib + nvidia-smi)
 | `tools/install-aliases.sh` | yes | yes |
 | `monitor/` | yes (needs `python3`; GPU fields need `nvidia-smi`) | yes (GPU fields stay `null`) |
 | `qgpu/` | yes (needs `python3` + `nvidia-smi`) | n/a (no NVIDIA `nvidia-smi`) |
+| `proxy/` | yes (needs `bash` + `curl` + `python3`) | yes (same; mihomo ships darwin builds) |
 
 Architectures: `x86_64` / `amd64` and `aarch64` / `arm64`.
 
@@ -78,7 +84,7 @@ sudo ./install-fast/install-root.sh
 ./install-fast/install-user.sh --dry-run
 ```
 
-Groups (default: all):
+Groups (default: all except `proxy` — the mihomo installer brings that one):
 
 | Group | Contents |
 |-------|----------|
@@ -87,8 +93,10 @@ Groups (default: all):
 | `dev` | g++ / build-essential, make, gdb, cmake, ninja, pkg-config |
 | `python` | uv + conda (Miniforge, includes `mamba`) |
 | `vcs` | gh (GitHub CLI) + glab (GitLab CLI), into `~/.local/bin` |
+| `rust` | rustup + stable toolchain (cargo, rustfmt, clippy) into `~/.cargo` |
 | `qgpu` | per-user GPU job queue CLI (see below) |
 | `monitor` | cron-driven node monitor + local dashboard (see below) |
+| `proxy` | `proxy on/off/status` CLI for mihomo, opt-in (see below) |
 
 Flags:
 
@@ -148,7 +156,25 @@ are skipped when the binary is already on `PATH`.
 Authentication is deliberately **not** automated: credentials belong to the
 user, not to a shared installer.
 
-### 3. Agent / harness installer
+### 3. Rust toolchain
+
+`--only rust` (in the default set) installs rustup + the stable toolchain into
+the standard `~/.rustup` and `~/.cargo`: user space, no root.
+
+```bash
+./install-fast/install-user.sh --only rust
+~/.cargo/bin/cargo --version   # the PATH entry comes from the managed block
+```
+
+- `rustup-init` comes from `sh.rustup.rs` (30 KB, reachable).
+- Components are fetched from `tuna` / `ustc` / `aliyun` (`RUSTUP_DIST_SERVER`)
+because `static.rust-lang.org` is slow from China; `--no-mirror` uses upstream.
+- `~/.cargo/config.toml` gets a sparse crates.io index pointing at `rsproxy.cn`,
+written only when the file does not exist yet — your own config is never touched.
+- Installed with `--no-modify-path`, so PATH stays in the single managed block.
+- C/C++ compilers are **not** part of this group: they come from `dev`.
+
+### 4. Agent / harness installer
 
 Interactive by default: it lists the supported agents, asks which to install,
 then installs the selection.
@@ -180,7 +206,7 @@ to conda). Because `fnm.vercel.app` is slow/blocked in some networks, the binary
 is fetched from GitHub releases (direct first, then the GitHub mirrors above)
 and Node itself from `npmmirror.com`.
 
-### 4. mihomo proxy installer
+### 5. mihomo proxy installer
 
 Install [mihomo](https://github.com/MetaCubeX/mihomo) (Clash Meta) into a config
 directory, together with a control script and a shell proxy environment.
@@ -199,10 +225,21 @@ mihomo         the release binary
 config.yaml    a minimal template, or your subscription config
 proxy-env.sh   source it to export HTTP(S)_PROXY / ALL_PROXY
 mihomoctl      start | stop | restart | status
+proxy          on | off | status | pick | nodes | test | update   (from proxy/)
+proxy-shell.sh shell integration for `proxy on|off`              (from proxy/)
 ```
 
 Flags: `--dir`, `--port`, `--controller-port`, `--config-url`, `--force-config`,
 `--version`, `--proxy`, `--with-service`, `--start`, `--dry-run`, `--no-color`.
+
+The installer also drops the `proxy` CLI next to `mihomoctl` and wires it into
+`~/.bashrc` (see [proxy](#proxy) below), so the everyday path is:
+
+```bash
+proxy on
+```
+
+Without the CLI, the manual path still works:
 
 ```bash
 source ~/Mihomo/proxy-env.sh
@@ -392,11 +429,51 @@ queue database alone.
 
 Full manual: [qgpu/README.md](./qgpu/README.md).
 
+## proxy
+
+`proxy` is the everyday layer on top of the mihomo installer: one command that
+starts mihomo, picks a node **that really transfers bytes**, and exports
+`HTTP(S)_PROXY` into the shell you are typing in.
+
+```bash
+./install-fast/install-user.sh --only proxy   # install + wire into ~/.bashrc
+
+proxy on          # start, pick a node, export the env
+proxy status      # VPN / node / egress / this shell
+proxy off         # stop, clear the env
+proxy nodes       # every node with live latency
+proxy node 3      # switch the main group (MATCH uses it)
+proxy test        # node latency + proxy-vs-direct download speed
+```
+
+Two design points, both learned the hard way:
+
+- **Node choice is measured, not guessed.** mihomo's URL-test latency says a
+node is alive; it does not say the node can carry a TLS connection. Candidates
+are ranked by latency and then downloaded through for real, and the fastest that
+moved bytes wins.
+- **The environment is per shell, and `proxy on` proves it worked.** `on` / `off`
+print `export` / `unset` lines that `proxy-shell.sh` evals into your shell — a
+child process cannot change its parent's environment. The wrapper now fails
+loudly when that block comes back empty, instead of printing "proxy on" and
+leaving the shell on a direct connection.
+
+Installed next to the mihomo instance (`~/Mihomo`, `--prefix` to change), with a
+launcher in `~/.local/bin` and a managed `# >>> infra-tools proxy >>>` block in
+`~/.bashrc` / `~/.zshrc`. `./proxy/install.sh --remove` takes all of it back out
+and leaves `config.yaml`, the binary and the cache alone.
+
+Full manual: [proxy/README.md](./proxy/README.md). Regression tests (stubbed
+controller, no network, no root): `./proxy/tests/run.sh`.
+
 ## Design principles
 
 - Plain Bash, minimal dependencies, no root required to read a dashboard.
-- Opt-in extras (`qgpu`, `monitor`) stay self-contained: stdlib only, private
-  state dir outside the repo, removable without touching the host.
+- Opt-in extras (`qgpu`, `monitor`, `proxy`) stay self-contained: stdlib only,
+  private state dir outside the repo, removable without touching the host.
+- Anything that edits your shell (`install-aliases.sh`, `proxy/install.sh`) writes
+  a managed `>>> ... >>>` block that is replaced on every run, so re-running or
+  removing it never clobbers unrelated configuration.
 - Detect the platform and package manager instead of assuming one distro.
 - Degrade — print a clear "not supported here" line rather than failing.
 - Idempotent installers; managed config blocks that do not overwrite yours.
