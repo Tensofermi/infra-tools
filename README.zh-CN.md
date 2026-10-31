@@ -84,6 +84,7 @@ sudo ./install-fast/install-root.sh
 | `cli` | tree、ripgrep（`rg`）、fd、fzf、tmux、htop |
 | `dev` | g++ / build-essential、make、gdb、cmake、ninja、pkg-config |
 | `python` | uv + conda（Miniforge，自带 `mamba`） |
+| `vcs` | gh（GitHub CLI）+ glab（GitLab CLI），装到 `~/.local/bin` |
 | `qgpu` | 个人 GPU 作业队列命令行（见下文） |
 | `monitor` | cron 驱动的节点监控 + 本地看板（见下文） |
 
@@ -94,7 +95,7 @@ sudo ./install-fast/install-root.sh
 | `--only GROUPS` | 只安装这些分组（逗号分隔） |
 | `--skip GROUPS` | 从默认集合中去掉这些分组 |
 | `--dry-run` | 只打印将要执行的操作 |
-| `--no-mirror` | 不写入 pip / uv / conda / HuggingFace 中国镜像 |
+| `--no-mirror` | 不写入 pip / uv / conda / HuggingFace 中国镜像，同时关闭 GitHub 下载镜像 |
 | `--use-sudo` | （用户态）允许用 sudo 安装系统包 |
 | `--no-color` | 关闭 ANSI 颜色 |
 | `--list` | 列出分组 |
@@ -108,8 +109,35 @@ sudo ./install-fast/install-root.sh
 - **托管 `PATH` 块** —— 用 `>>> install-fast >>>` 标记写入，绝不覆盖你已有的 shell 配置。
 - **中国镜像** —— 默认写 pip / uv / conda / HuggingFace 镜像（`--no-mirror` 可关闭）；
   apt 源不动。
+- **Miniforge 走国内镜像站** —— 官方 `github.com/.../latest/download` 在国内实测只有
+  13 KB/s，128 MB 安装包要下一个多小时，看起来就像卡死。`install_conda()` 现在先试
+  北外 / 清华 / 南大（它们把 release 原样同步到国内，实测 ~13 MB/s），下载后用官方
+  发布的 `.sha256` 校验再执行；GitHub 只作兜底。
+- **GitHub 兜底链路** —— 先直连；10 秒内速度低于 1 KB/s 或连不上时，依次改用
+  `gh-proxy.com`、`ghfast.top`。可用 `GH_MIRROR=<前缀>` / `GH_MIRRORS="a b"` 覆盖，
+  `GH_MIRROR_FIRST=1` 镜像优先，`--no-mirror` 或 `DISABLE_GH_MIRROR=1` 完全关闭。
 
-### 2. Agent / harness 安装器
+### 2. 仓库命令行（gh / glab）
+
+`--only vcs`（包含在默认集合里）把两个 forge 命令行工具作为单文件二进制装进
+`~/.local/bin`，不需要 root，也不用额外加 apt 源：
+
+```bash
+./install-fast/install-user.sh --only vcs
+gh --version && glab --version
+gh auth login        # 每个账户只需一次
+```
+
+- **gh** —— 从 `api.github.com/repos/cli/cli/releases/latest` 解析最新 release，走 GitHub
+  镜像链下载且镜像优先（直连 ~13 KB/s，`gh-proxy.com` ~90 KB/s）。
+- **glab** —— 它的发布仓库在 **gitlab.com**（GitHub 上的 `gitlab-org/cli` 已 404），
+  因此改用 GitLab releases API 解析，直接从 `gitlab.com` 下载，不走 GitHub 镜像。
+- 两者在 release API 取不到时都回落到写死的版本；已经在 `PATH` 上时直接跳过。
+- macOS：交给 Homebrew（`brew install gh glab`）。
+
+登录**故意不做自动化**：凭据属于个人，不该由共享服务器上的安装器代管。
+
+### 3. Agent / harness 安装器
 
 默认交互式：列出支持的 agent，询问要装哪些，然后安装所选内容。
 
@@ -139,7 +167,7 @@ sudo ./install-fast/install-root.sh
 部分网络下 `fnm.vercel.app` 很慢/被墙，安装器改从 GitHub release 取 fnm 二进制，
 Node 本体走 `npmmirror.com`。
 
-### 3. mihomo 代理安装器
+### 4. mihomo 代理安装器
 
 把 [mihomo](https://github.com/MetaCubeX/mihomo)（Clash Meta）装进一个配置目录，
 并生成控制脚本和 shell 代理环境。

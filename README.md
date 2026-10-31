@@ -86,6 +86,7 @@ Groups (default: all):
 | `cli` | tree, ripgrep (`rg`), fd, fzf, tmux, htop |
 | `dev` | g++ / build-essential, make, gdb, cmake, ninja, pkg-config |
 | `python` | uv + conda (Miniforge, includes `mamba`) |
+| `vcs` | gh (GitHub CLI) + glab (GitLab CLI), into `~/.local/bin` |
 | `qgpu` | per-user GPU job queue CLI (see below) |
 | `monitor` | cron-driven node monitor + local dashboard (see below) |
 
@@ -96,7 +97,7 @@ Flags:
 | `--only GROUPS` | install only these groups (comma list) |
 | `--skip GROUPS` | remove groups from the default set |
 | `--dry-run` | print what would happen |
-| `--no-mirror` | skip writing pip / uv / conda / HuggingFace China mirrors |
+| `--no-mirror` | skip writing pip / uv / conda / HuggingFace China mirrors, and skip the GitHub download mirrors |
 | `--use-sudo` | (user mode) allow sudo for system packages |
 | `--no-color` | disable ANSI colors |
 | `--list` | list groups |
@@ -112,8 +113,42 @@ Behavior highlights:
   never clobbers existing shell configuration.
 - **China mirrors** — pip / uv / conda / HuggingFace by default (`--no-mirror`
   to disable). apt sources are left untouched.
+- **Miniforge from a domestic mirror** — the official `github.com/.../latest/download`
+  URL runs at ~13 KB/s from China, so the 128 MB installer used to look hung.
+  `install_conda()` tries `bfsu` / `tuna` / `nju` first (they mirror the release
+  byte-for-byte; measured ~13 MB/s) and verifies the published `.sha256`
+  before running the script. GitHub is the fallback.
+- **GitHub fallback** — direct GitHub is tried first; if a transfer stalls
+  (under 1 KB/s for 10 s) or cannot connect, `download()` retries through
+  `gh-proxy.com` and then `ghfast.top`. Override with `GH_MIRROR=<prefix>` /
+  `GH_MIRRORS="a b"`, prefer mirrors with `GH_MIRROR_FIRST=1`, disable with
+  `--no-mirror` or `DISABLE_GH_MIRROR=1`.
 
-### 2. Agent / harness installer
+### 2. Repository CLIs (gh / glab)
+
+`--only vcs` (part of the default set) installs the two forge CLIs as static
+binaries into `~/.local/bin` — no root, no extra apt repository:
+
+```bash
+./install-fast/install-user.sh --only vcs
+gh --version && glab --version
+gh auth login        # once per account
+```
+
+- **gh** — resolved from `api.github.com/repos/cli/cli/releases/latest` through
+the GitHub mirror chain, downloaded mirror-first (direct GitHub is ~13 KB/s,
+`gh-proxy.com` is ~90 KB/s).
+- **glab** — its release lives on **gitlab.com** (`gitlab-org/cli` does not exist
+on GitHub), so it is read from the GitLab releases API and fetched directly
+from `gitlab.com` — no GitHub mirror involved.
+- Both fall back to a pinned version if the release API is unreachable, and both
+are skipped when the binary is already on `PATH`.
+- macOS: delegated to Homebrew (`brew install gh glab`).
+
+Authentication is deliberately **not** automated: credentials belong to the
+user, not to a shared installer.
+
+### 3. Agent / harness installer
 
 Interactive by default: it lists the supported agents, asks which to install,
 then installs the selection.
@@ -142,9 +177,10 @@ At the prompt, enter numbers or keys separated by commas (`1,4,6` or
 
 Node/npm are bootstrapped into user space with `fnm` when missing (falling back
 to conda). Because `fnm.vercel.app` is slow/blocked in some networks, the binary
-is fetched from GitHub releases and Node itself from `npmmirror.com`.
+is fetched from GitHub releases (direct first, then the GitHub mirrors above)
+and Node itself from `npmmirror.com`.
 
-### 3. mihomo proxy installer
+### 4. mihomo proxy installer
 
 Install [mihomo](https://github.com/MetaCubeX/mihomo) (Clash Meta) into a config
 directory, together with a control script and a shell proxy environment.
