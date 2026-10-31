@@ -1,0 +1,673 @@
+#!/usr/bin/env bash
+# proxy — tiny control CLI for a local mihomo (Clash Meta) instance
+#
+#   proxy              同 proxy status
+#   proxy on [-k]      启动 VPN + 自动挑一个实测通畅的节点 + 当前 shell 开代理（-k 保留当前节点）
+#   proxy off          停止 VPN + 当前 shell 关代理
+#   proxy toggle       在 on/off 之间翻转
+#   proxy status       VPN / 节点 / 出口 / 本 shell 环境总览
+#   proxy pick         立刻重挑最快节点（不重启 daemon）
+#   proxy nodes        列出主组全部节点及实时延迟
+#   proxy node [N|名称] 查看或切换主组（MATCH 走的就是它）
+#   proxy test         节点延迟 + 代理/直连下载速度对比
+#   proxy ip           查看代理出口 IP 与归属地
+#   proxy update       重新拉取订阅（PROXY_SUB_FILE）并重启
+#   proxy log [N]      查看 mihomo 日志（默认 30 行）
+#   proxy env          打印 export 语句（供 eval "$(proxy env)"）
+#
+# on/off/toggle 把 shell 代码打到 stdout、人类可读信息打到 stderr，好让
+# proxy-shell.sh 里的 shell 函数把 export/unset eval 进当前 shell。
+#
+# 环境变量：
+#   MIHOMO_DIR         mihomo 实例目录（默认读 ~/.config/infra-tools/mihomo-dir，再退回 ~/Mihomo）
+#   PROXY_MAIN_GROUP   主分组名（默认 节点选择）
+#   PROXY_AUTO_GROUP   回退用的自动分组（默认自动探测 url-test / fallback 组）
+#   PROXY_SUB_FILE     订阅链接文件（默认 $MIHOMO_DIR/subscription）
+#   PROXY_SUB_INSECURE=1  订阅用自签证书时才关掉 TLS 校验（默认校验）
+#   PROXY_NO_PROXY     额外的直连域名，逗号分隔（内网/公司域名走这个，不要写进代码）
+#   PROXY_NO_CN_MIRRORS=0  连国内镜像也不绕过代理（默认绕过）
+#   PROXY_TEST_URL     测速样本 URL（默认本机 mihomo 版本对应的 GitHub release）
+#   PROXY_PICK_CANDIDATES / PROXY_PICK_GOOD_SPEED / PROBE_SECS  见 proxy help
+#
+# 依赖：bash、curl >= 7.55（-H @-）、python3（解析 controller 的 JSON）、
+#       ss / lsof / procfs 任一（探测端口；都没有时明说“无法确认”）
+set -uo pipefail
+
+DIR="${MIHOMO_DIR:-}"
+if [[ -z "$DIR" ]]; then
+  # 安装时用 --prefix 装到别处的情况，由 install.sh 记在 marker 里
+  CONF_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/infra-tools"
+  [[ -r "${CONF_HOME}/mihomo-dir" ]] && IFS= read -r DIR <"${CONF_HOME}/mihomo-dir"
+  DIR="${DIR:-$HOME/Mihomo}"
+fi
+CTL="$DIR/mihomoctl"
+BIN="$DIR/mihomo"
+CONF="$DIR/config.yaml"
+LOG="$DIR/mihomo.log"
+PIDF="$DIR/mihomo.pid"
+SUBFILE="${PROXY_SUB_FILE:-$DIR/subscription}"
+PING_URL="${PROXY_PING_URL:-http://www.gstatic.com/generate_204}"
+MAIN_GROUP="${PROXY_MAIN_GROUP:-节点选择}"
+# 候选节点全不通时的回退分组；留空则自动找 url-test / fallback 类型的组。
+AUTO_GROUP="${PROXY_AUTO_GROUP:-}"
+# 订阅用自签证书时才设 1；默认保持 TLS 校验（订阅能改路由，不能裸奔）。
+INSECURE_SUB="${PROXY_SUB_INSECURE:-0}"
+TMPF=""
+trap '[ -n "${TMPF}" ] && rm -f "${TMPF}"' EXIT
+
+if [[ -t 1 || -t 2 ]]; then
+  B=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GRN=$'\033[32m'
+  YEL=$'\033[33m'; RST=$'\033[0m'
+else
+  B=; DIM=; RED=; GRN=; YEL=; RST=
+fi
+
+msg()  { printf '%s\n' "$*" >&2; }
+warn() { printf '%s%s%s\n' "$YEL" "$*" "$RST" >&2; }
+die()  { printf '%sproxy: %s%s\n' "$RED" "$*" "$RST" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------- config ------
+
+cfg_get() { # key fallback
+  local k="$1" def="${2:-}" v
+  [[ -f "$CONF" ]] || { printf '%s' "$def"; return; }
+  v="$(sed -nE "s/^[[:space:]]*${k}:[[:space:]]*([^#]*).*/\1/p" "$CONF" 2>/dev/null |
+    head -1 | sed -E "s/[[:space:]]+$//; s/^['\"]//; s/['\"]$//")"
+  [[ -n "$v" ]] && printf '%s' "$v" || printf '%s' "$def"
+}
+
+PORT="$(cfg_get mixed-port 17890)"
+CTRLA="$(cfg_get external-controller 127.0.0.1:19090)"
+SECRET="$(cfg_get secret '')"
+PROXY_URL="http://127.0.0.1:${PORT}"
+
+# 测速样本 = 本机同一版本的 GitHub release（就是平时真正要下东西的地方）
+GOARCH="$(uname -m)"; case "$GOARCH" in x86_64) GOARCH=amd64 ;; aarch64|arm64) GOARCH=arm64 ;; esac
+VER="$("$BIN" -v 2>/dev/null | sed -nE 's|.* (v[0-9]+\.[0-9]+\.[0-9]+) .*|\1|p')"
+VER="${VER:-v1.19.33}"
+TEST_URL="${PROXY_TEST_URL:-https://github.com/MetaCubeX/mihomo/releases/download/${VER}/mihomo-$(uname -s | tr 'A-Z' 'a-z')-${GOARCH}-${VER}.gz}"
+
+# ----------------------------------------------------------------- utils ------
+
+uenc() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]),end="")' "$1"; }
+
+api() { # path [curl args...]
+  local p="$1"; shift
+  # 带 secret 时用 -H @- 从 stdin 读头：既不进 ps 的命令行，也不会被拆词。
+  if [[ -n "$SECRET" ]]; then
+    curl -s --max-time "${API_TIMEOUT:-8}" -H @- "$@" "http://${CTRLA}${p}" \
+      <<<"Authorization: Bearer ${SECRET}"
+  else
+    curl -s --max-time "${API_TIMEOUT:-8}" "$@" "http://${CTRLA}${p}"
+  fi
+}
+
+json_get() { # key  (json on stdin)
+  python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get(sys.argv[1],"") or "", end="")
+except Exception: pass' "$1" 2>/dev/null
+}
+
+is_running() { [[ -f "$PIDF" ]] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; }
+pid_val()    { cat "$PIDF" 2>/dev/null; }
+# 端口是否在监听：ss → lsof → /proc/net/tcp；都不可用时明说“无法确认”，
+# 而不是默认健康（否则 mihomoctl 刚修好的“进程活着但没绑端口”又会被当成正常）。
+is_listening() {
+  case "$PORT" in ''|*[!0-9]*) return 0 ;; esac
+  if have ss; then
+    ss -ltnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${PORT}$"
+  elif have lsof; then
+    lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk -v p=":${PORT}" '$9 ~ p"$"' | grep -q .
+  elif [[ -r /proc/net/tcp ]]; then
+    awk -v h=":$(printf '%04X' "$PORT")" 'FNR > 1 && toupper($2) ~ h"$" && $4 == "0A" { f = 1 }
+      END { exit f ? 0 : 1 }' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+  else
+    msg "${DIM}（没有 ss / lsof / procfs，无法确认 ${PORT} 是否在监听）${RST}"
+    return 0
+  fi
+}
+
+group_json() { api "/proxies/$(uenc "$1")"; }
+group_now()  { group_json "$1" | json_get now; }
+
+# 组内“真节点”：订阅常在节点列表里塞信息条目（剩余流量 / 套餐到期…），
+# 它们不是节点，既不该出现在列表里，也不该被 `proxy node N` 选中。
+group_members() { # group -> 每行一个
+  group_json "$1" | python3 -c '
+import json, sys
+INFO = ("剩余流量", "套餐到期", "过滤掉", "官网", "到期时间", "流量重置")
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for n in d.get("all") or []:
+    if not any(k in n for k in INFO):
+        print(n)' 2>/dev/null
+}
+
+is_group() { # name -> yes/no
+  group_json "$1" | python3 -c '
+import json, sys
+try:
+    print("yes" if json.load(sys.stdin).get("all") else "no", end="")
+except Exception:
+    print("no", end="")' 2>/dev/null
+}
+
+# 出口链路："自动选择 → 日本-优化"（组里直接是节点时就只显示节点）。
+# 不比对组名：选中项本身是一个组就展开一层，订阅叫 Auto / PROXY / ♻️ 都行。
+selected_chain() {
+  local now sub
+  now="$(group_now "$MAIN_GROUP")"
+  if [[ -n "$now" ]] && [[ "$(is_group "$now")" == "yes" ]]; then
+    sub="$(group_now "$now")"
+    printf '%s → %s' "$now" "${sub:-?}"
+  else
+    printf '%s' "${now:-?}"
+  fi
+}
+selected_node() { local c; c="$(selected_chain)"; printf '%s' "${c##* }"; }
+
+# 回退目标：PROXY_AUTO_GROUP > 第一个 url-test / fallback / load-balance 类型的组。
+# 不写死“自动选择”：订阅里的组名因人而异（Auto / PROXY / ♻️ 自动选择…）。
+pick_auto_group() {
+  if [[ -n "$AUTO_GROUP" ]]; then printf '%s' "$AUTO_GROUP"; return 0; fi
+  api /proxies | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin).get("proxies") or {}
+except Exception:
+    sys.exit(0)
+pref = ("URLTest", "Fallback", "LoadBalance")
+cands = [k for k, v in d.items() if v.get("type") in pref and v.get("all")]
+if cands:
+    auto = [k for k in cands if "自动" in k or "auto" in k.lower()]
+    print((auto or cands)[0], end="")' 2>/dev/null
+}
+
+# 单个节点延迟（mihomo 自己测的，不受分流规则影响），0 = 没测出
+node_delay() { # name -> ms
+  local j
+  j="$(api "/proxies/$(uenc "$1")/delay?url=$(uenc "$PING_URL")&timeout=3000")"
+  j="$(printf '%s' "$j" | json_get delay)"
+  case "$j" in ''|*[!0-9]*) printf '0' ;; *) printf '%s' "$j" ;; esac
+}
+
+# 切换主组，所有自动挑节点都走这里
+switch_group() { # name -> 0 表示成功
+  local resp code
+  resp="$(api "/proxies/$(uenc "$MAIN_GROUP")" -X PUT -H 'Content-Type: application/json' \
+    -d "$(python3 -c 'import json,sys;print(json.dumps({"name":sys.argv[1]}))' "$1")" \
+    -w '\n%{http_code}' 2>/dev/null)"
+  code="${resp##*$'\n'}"
+  [[ "$code" == "204" || "$code" == "200" ]]
+}
+
+group_delay_map() { # group -> {"节点": 延迟, ...}
+  local m
+  m="$(api "/group/$(uenc "$1")/delay?url=$(uenc "$PING_URL")&timeout=3000" 2>/dev/null)"
+  case "$m" in \{*\}) printf '%s' "$m" ;; *) printf '{}' ;; esac
+}
+
+# 实测单个节点的吞吐：固定时间窗口内尽量多下 TEST_URL（走 MATCH → 节点选择，
+# 就是要验证的那条路）。分母用 总耗时 - 首字节耗时，把 TLS 握手和跨境 TTFB
+# 排除掉，否则高延迟节点在 3 秒窗口里会被算成几百 B/s。
+probe_node() { # name -> bytes/s（0 = 不通）
+  local r
+  switch_group "$1" >/dev/null 2>&1 || { printf '0'; return; }
+  r="$(curl -sL -o /dev/null --max-time "${PROBE_SECS:-3}" -x "$PROXY_URL" \
+    -r 0-8388607 -w '%{size_download} %{time_total} %{time_starttransfer}' "$TEST_URL" 2>/dev/null)"
+  awk -v r="$r" 'BEGIN {
+    n = split(r, a, " ")
+    if (n == 3 && a[1] + 0 > 0) {
+      d = a[2] - a[3]
+      if (d < 0.3) d = 0.3
+      printf "%d", a[1] / d
+    } else printf "0" }'
+}
+
+fmt_delay() { if [[ "${1:-0}" == "0" || -z "${1:-}" ]]; then printf '延迟测不出'; else printf '%s ms' "$1"; fi; }
+
+fmt_speed() { awk -v b="$1" 'BEGIN {
+  if (b <= 0) { print "不通"; exit }
+  if (b >= 1048576) printf "%.1f MB/s", b/1048576
+  else if (b >= 1024) printf "%.0f KB/s", b/1024
+  else printf "%.0f B/s", b }'; }
+
+# ------------------------------------------------------------------- env ------
+
+# 注意：heredoc 的变量替换发生在整行展开的那一刻，而不是逐行执行。
+# 所以 no_proxy 不能写成 "$NO_PROXY"（等前面那行 export 生效）——在 set -u 下
+# NO_PROXY 未定义会直接让整个 emit_env 失败，proxy on 就变成"只打印成功、什么都没设"。
+# 这里先算成普通变量再插值。
+# 默认只绕过回环与私网；国内镜像/内网服务属于“这台机器上想要”的东西，
+# 用 PROXY_NO_PROXY 追加（逗号分隔），公司内网域名不该写进公共仓库。
+NO_PROXY_BASE="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+NO_PROXY_CN_MIRRORS=".tencentyun.com,.myqcloud.com,mirrors.cloud.tencent.com,.npmmirror.com,mirrors.aliyun.com,mirrors.tuna.tsinghua.edu.cn,api.deepseek.com,api.moonshot.cn,dashscope.aliyuncs.com,open.bigmodel.cn"
+NO_PROXY_LIST="$NO_PROXY_BASE"
+[[ "${PROXY_NO_CN_MIRRORS:-1}" == "0" ]] ||
+  NO_PROXY_LIST="${NO_PROXY_LIST},${NO_PROXY_CN_MIRRORS}"
+[[ -n "${PROXY_NO_PROXY:-}" ]] &&
+  NO_PROXY_LIST="${NO_PROXY_LIST},${PROXY_NO_PROXY}"
+
+emit_env() {
+  cat <<EOF
+export HTTP_PROXY="${PROXY_URL}"
+export HTTPS_PROXY="${PROXY_URL}"
+export ALL_PROXY="${PROXY_URL}"
+export http_proxy="${PROXY_URL}"
+export https_proxy="${PROXY_URL}"
+export all_proxy="${PROXY_URL}"
+export NO_PROXY="${NO_PROXY_LIST}"
+export no_proxy="${NO_PROXY_LIST}"
+EOF
+}
+
+emit_unset() {
+  cat <<'EOF'
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy NO_PROXY no_proxy
+EOF
+}
+
+shell_env() { printf '%s' "${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}"; }
+
+# 出口信息：ip-api 优先、ipinfo 兜底（ip-api 免费版有频率限制）。
+# 一律输出 tab 分隔：status<TAB>country<TAB>city<TAB>isp<TAB>ip
+egress_info() {
+  local out st country city isp ip
+  out="$(curl -s --max-time 5 -x "$PROXY_URL" \
+    'http://ip-api.com/line/?fields=status,country,city,isp,query' 2>/dev/null | tr '\n' $'\t')"
+  IFS=$'\t' read -r st country city isp ip <<<"$out"
+  if [[ "$st" == "success" ]]; then
+    printf '%s\t%s\t%s\t%s\t%s' "$st" "$country" "$city" "$isp" "$ip"
+    return 0
+  fi
+  out="$(curl -s --max-time 5 -x "$PROXY_URL" https://ipinfo.io/json 2>/dev/null)"
+  [[ -n "$out" ]] || return 1
+  out="$(printf '%s' "$out" | python3 -c 'import sys, json
+try:
+    d = json.load(sys.stdin)
+    loc = ", ".join([x for x in [d.get("city"), d.get("region")] if x]) or "?"
+    print("success\t%s\t%s\t%s\t%s" % (d.get("country", "?"), loc,
+          d.get("org", "?"), d.get("ip", "?")), end="")
+except Exception:
+    pass' 2>/dev/null)"
+  [[ -n "$out" ]] || return 1
+  printf '%s' "$out"
+}
+
+# ------------------------------------------------------------- lifecycle ------
+
+start_daemon() {
+  local out
+  if ! out="$("$CTL" start 2>&1)"; then
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+  printf '%s\n' "$(printf '%s' "$out" | tail -1)" >&2
+}
+
+stop_daemon() {
+  local out
+  if ! out="$("$CTL" stop 2>&1)"; then
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+  printf '%s\n' "$(printf '%s' "$out" | tail -1)" >&2
+}
+
+# ------------------------------------------------------------------ verbs -----
+
+cmd_on() {
+  local keep=0
+  case "${1:-}" in -k|--keep) keep=1 ;; esac
+
+  if is_running && is_listening; then
+    msg "${GRN}✔${RST} mihomo 已在运行 (pid $(pid_val), ${PROXY_URL})"
+  elif is_running; then
+    warn "! 进程存在但 ${PORT} 未监听，重启中…"
+    "$CTL" stop >/dev/null 2>&1
+    start_daemon || return 1
+  else
+    start_daemon || return 1
+  fi
+
+  # 自动选节点：光看 mihomo 报的延迟会骗人（120ms 的节点可能已经堵死），
+  # 所以候选节点都要真下一段数据验证一下。stdout 留给 eval，过程信息走 stderr。
+  if ((keep)); then
+    msg "${DIM}保留当前节点：$(selected_chain)${RST}"
+  elif is_listening; then
+    cmd_pick >&2 || warn "! 自动挑节点没成功，继续用 $(selected_chain)"
+  fi
+
+  emit_env
+  msg "${GRN}✔${RST} 当前 shell 代理已开启 → ${B}${PROXY_URL}${RST}  节点 ${B}$(selected_chain)${RST}  ${DIM}(关闭: proxy off)${RST}"
+}
+
+cmd_off() {
+  if is_running; then
+    stop_daemon || return 1
+  else
+    msg "${DIM}mihomo 未在运行${RST}"
+  fi
+  emit_unset
+  msg "${GRN}✔${RST} 当前 shell 代理已关闭"
+}
+
+cmd_toggle() { if is_running; then cmd_off; else cmd_on "$@"; fi; }
+
+cmd_status() {
+  local running=0 chain delay egress se st country city isp ip
+  is_running && running=1
+  se="$(shell_env)"
+
+  if ((running)); then
+    printf '%s● VPN%s  %sON%s   %spid %s · %s · ctrl %s%s\n' \
+      "$GRN" "$RST" "$B$GRN" "$RST" "$DIM" "$(pid_val)" "$PROXY_URL" "$CTRLA" "$RST"
+    is_listening || printf '  %s! 进程在但 %s 没监听，proxy on 会修%s\n' "$YEL" "$PORT" "$RST"
+  else
+    printf '%s● VPN%s  %sOFF%s  %s(停用，proxy on 开启)%s\n' \
+      "$YEL" "$RST" "$B$YEL" "$RST" "$DIM" "$RST"
+  fi
+
+  if ((running)) && is_listening; then
+    chain="$(selected_chain)"
+    IFS=$'\t' read -r st country city isp ip <<<"$(egress_info)"
+    delay="$(node_delay "$(selected_node)")"
+
+    if [[ "$delay" != "0" ]]; then
+      printf '  %-6s %s%s%s  %s%s ms%s\n' "节点" "$B" "$chain" "$RST" "$DIM" "$delay" "$RST"
+    elif [[ "${st:-}" == "success" ]]; then
+      printf '  %-6s %s%s%s  %smihomo 测不出延迟，但代理本身可用%s\n' "节点" "$B" "$chain" "$RST" "$DIM" "$RST"
+    else
+      printf '  %-6s %s%s%s  %s延迟测不出，出口也不通%s\n' "节点" "$B" "$chain" "$RST" "$YEL" "$RST"
+    fi
+
+    if [[ "${st:-}" == "success" ]]; then
+      printf '  %-6s %s%s%s  %s%s / %s (%s)%s\n' "出口" "$B" "$ip" "$RST" "$DIM" "$country" "$city" "$isp" "$RST"
+    else
+      printf '  %-6s %s出口查询失败%s\n' "出口" "$DIM" "$RST"
+    fi
+  fi
+
+  if [[ "$se" == "$PROXY_URL" ]]; then
+    printf '  %-6s %s%s%s %s✔ 已开启%s\n' "本shell" "$B" "$se" "$RST" "$GRN" "$RST"
+  elif [[ -n "$se" ]]; then
+    printf '  %-6s %s%s%s %s(指向别处，不是本实例)%s\n' "本shell" "$B" "$se" "$RST" "$YEL" "$RST"
+  else
+    printf '  %-6s %s未开启%s  %s(proxy on)%s\n' "本shell" "$DIM" "$RST" "$DIM" "$RST"
+  fi
+
+  ((running)) || return 1
+}
+
+# 节点列表渲染：节点名单走 stdin（已由 group_members 过滤掉信息条目），
+# 延迟 JSON 与当前节点走 argv（heredoc 会吃掉 stdin，所以程序用 -c 传）。
+# 打印的编号就是 `proxy node <N>` 用的编号。
+NODES_PY='
+import json, sys, unicodedata
+delays = json.loads(sys.argv[1] or "{}")
+now = sys.argv[2]
+color = sys.argv[3] == "1"
+nodes = [l.rstrip("\n") for l in sys.stdin if l.strip()]
+def width(s):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+alive = [n for n in nodes if delays.get(n, 0) > 0]
+fastest = min(alive, key=lambda n: delays[n]) if alive else None
+w = max([width(n) for n in nodes] + [8])
+for i, n in enumerate(nodes, 1):
+    dl = delays.get(n, 0)
+    mark = ("\033[32m*\033[0m" if color else "*") if n == now else " "
+    star = "  <- 最快" if n == fastest else ""
+    pltxt = "%d ms" % dl if dl > 0 else "--"
+    print("%s%3d) %s%s %7s%s" % (mark, i, n, " " * (w - width(n)), pltxt, star))
+'
+
+cmd_nodes() {
+  is_running || die "mihomo 未运行（先 proxy on）"
+  local delays now color=0
+  [[ -t 1 ]] && color=1
+  msg "${DIM}正在测速 ${MAIN_GROUP} 组…${RST}"
+  delays="$(group_delay_map "$MAIN_GROUP")"
+  [[ "$delays" == "{}" ]] && warn "! 取节点延迟失败，只列名单"
+  now="$(group_now "$MAIN_GROUP")"
+  group_members "$MAIN_GROUP" | python3 -c "$NODES_PY" "$delays" "$now" "$color" 2>/dev/null ||
+    die "读不到 ${MAIN_GROUP} 组（controller ${CTRLA} 不通？）"
+  printf '\n%s切换：proxy node <编号|名称>%s\n' "$DIM" "$RST"
+}
+
+cmd_node() {
+  is_running || die "mihomo 未运行（先 proxy on）"
+  local now json all target
+  json="$(group_json "$MAIN_GROUP")"
+  [[ -n "$json" ]] || die "读不到 ${MAIN_GROUP} 组（controller ${CTRLA} 不通？）"
+  now="$(printf '%s' "$json" | json_get now)"
+  all="$(group_members "$MAIN_GROUP")"
+
+  if [[ $# -eq 0 ]]; then
+    printf '当前 %s → %s%s%s\n' "$MAIN_GROUP" "$B" "$now" "$RST"
+    printf '%s用 proxy nodes 看列表，proxy node <编号|名称> 切换%s\n' "$DIM" "$RST"
+    return 0
+  fi
+
+  target=""
+  if [[ "$1" =~ ^[0-9]+$ ]]; then
+    target="$(printf '%s\n' "$all" | sed -n "$1p")"
+    [[ -n "$target" ]] || die "编号 $1 超出范围（proxy nodes 查看）"
+  else
+    local hits n
+    hits="$(printf '%s\n' "$all" | grep -iF -- "$1" || true)"
+    n="$(printf '%s' "$hits" | grep -c . || true)"
+    if [[ "$n" -eq 1 ]]; then
+      target="$hits"
+    elif [[ "$n" -eq 0 ]]; then
+      die "没有匹配 \"$1\" 的节点（proxy nodes 查看）"
+    else
+      printf '%s多个匹配，请写具体点或改用编号：%s\n' "$YEL" "$RST"
+      printf '%s\n' "$hits" | sed 's/^/  - /'
+      return 1
+    fi
+  fi
+
+  [[ "$target" == "$now" ]] && { printf '已经是 %s%s%s 了\n' "$B" "$target" "$RST"; return 0; }
+
+  switch_group "$target" || die "切换失败 目标=${target}"
+  sleep 0.4
+  local newnow dl
+  newnow="$(group_now "$MAIN_GROUP")"
+  [[ "$newnow" == "$target" ]] || die "切换未生效（现在还是 ${newnow}）"
+  dl="$(node_delay "$(selected_node)")"
+  printf '%s✔%s %s → %s%s%s  %s%s%s\n' "$GRN" "$RST" "$MAIN_GROUP" "$B" "$newnow" "$RST" \
+    "$DIM" "$(fmt_delay "$dl")" "$RST"
+}
+
+cmd_pick() {
+  is_running || die "mihomo 未运行（先 proxy on）"
+  local json map cands name sp best="" bestsp=0 tries=0 total
+  local CAND_N="${PROXY_PICK_CANDIDATES:-3}"
+  local GOOD="${PROXY_PICK_GOOD_SPEED:-4194304}"
+
+  json="$(group_json "$MAIN_GROUP")"
+  [[ -n "$json" ]] || die "读不到 ${MAIN_GROUP}（controller ${CTRLA} 不通？）"
+
+  msg "${DIM}mihomo 延迟排序，取前 ${CAND_N} 个候选再实测…${RST}"
+  map="$(group_delay_map "$MAIN_GROUP")"
+  cands="$(printf '%s' "$json" | python3 -c '
+import json, sys
+delays = json.loads(sys.argv[1] or "{}")
+limit = int(sys.argv[2])
+d = json.load(sys.stdin)
+INFO = ("剩余流量", "套餐到期", "过滤掉", "官网", "到期时间")
+nodes = [n for n in (d.get("all") or []) if not any(k in n for k in INFO)]
+ok = [n for n in nodes if delays.get(n, 0) > 0]
+ok.sort(key=lambda n: delays[n])
+print("\n".join(ok[:limit]), end="")' "$map" "$CAND_N" 2>/dev/null)"
+
+  total="$(printf '%s\n' "$cands" | grep -c . || true)"
+  if [[ "${total:-0}" -eq 0 ]]; then
+    local fb; fb="$(pick_auto_group)"
+    [[ -n "$fb" ]] ||
+      die "组内延迟全是 0，且找不到可回退的自动分组（proxy node <名称> 手动选，或设 PROXY_AUTO_GROUP=<组名>）"
+    warn "! 组内延迟全是 0，回退 ${fb}"
+    switch_group "$fb" >/dev/null 2>&1 || return 1
+    return 0
+  fi
+
+  while read -r name; do
+    [[ -n "$name" ]] || continue
+    tries=$((tries + 1))
+    msg "${DIM}  实测 $tries/$total: $name …${RST}"
+    sp="$(probe_node "$name")"
+    if (( sp > 0 )); then
+      if (( sp > bestsp )); then best="$name"; bestsp="$sp"; fi
+      (( bestsp >= GOOD )) && break
+    fi
+  done <<<"$cands"
+
+  if [[ -n "$best" ]]; then
+    switch_group "$best" || die "切到 ${best} 失败"
+    local dl; dl="$(node_delay "$best")"
+    printf '%s✔%s 已选 %s%s%s  %s实测 %s · %s%s\n' \
+      "$GRN" "$RST" "$B" "$best" "$RST" "$DIM" "$(fmt_speed "$bestsp")" "$(fmt_delay "$dl")" "$RST"
+  else
+    local fb; fb="$(pick_auto_group)"
+    if [[ -z "$fb" ]]; then
+      warn "! 候选节点实测都不通，且找不到可回退的自动分组（设 PROXY_AUTO_GROUP=<组名>）"
+      return 1
+    fi
+    warn "! 候选节点实测都不通，回退 ${fb}"
+    switch_group "$fb" >/dev/null 2>&1 || true
+    return 1
+  fi
+}
+
+cmd_test() {
+  is_running || die "mihomo 未运行（先 proxy on）"
+  local pd sd lat rtt
+  lat="$(node_delay "$(selected_node)")"
+  printf '当前节点  %s\n' "$(selected_chain)"
+  if [[ "$lat" != "0" ]]; then
+    printf '节点延迟  %s ms  %s(mihomo 测得)%s\n' "$lat" "$DIM" "$RST"
+  else
+    rtt="$(curl -s -o /dev/null --max-time 6 -x "$PROXY_URL" -w '%{time_total}' "$PING_URL" 2>/dev/null)"
+    rtt="$(awk -v t="$rtt" 'BEGIN{ if (t+0>0) printf "%d", t*1000 }')"
+    if [[ -n "$rtt" ]]; then
+      printf '节点延迟  %s ms  %s(实测，mihomo 没测出)%s\n' "$rtt" "$DIM" "$RST"
+    else
+      printf '节点延迟  测不出\n'
+    fi
+  fi
+  msg "${DIM}经代理下载（样本 $(basename "$TEST_URL")）…${RST}"
+  pd="$(curl -sfL -o /dev/null --max-time 25 -x "$PROXY_URL" -w '%{speed_download}' "$TEST_URL" 2>/dev/null)"
+  printf '代理速度  %s%s%s\n' "$B" "$(fmt_speed "${pd:-0}")" "$RST"
+  msg "${DIM}直连下载 8 秒做对比…${RST}"
+  sd="$(curl -sfL -o /dev/null --max-time 8 --noproxy '*' -w '%{speed_download}' "$TEST_URL" 2>/dev/null)"
+  printf '直连速度  %s\n' "$(fmt_speed "${sd:-0}")"
+  awk -v a="${pd:-0}" -v b="${sd:-0}" 'BEGIN {
+    if (a > 0 && b > 0) printf "加速比    %.0f×\n", a / b
+    else if (a > 0) printf "加速比    ∞（直连基本不通）\n" }'
+  if [[ -z "${pd:-}" ]]; then
+    warn "! 代理下载失败：节点不通，或测速 URL 失效（PROXY_TEST_URL=... 换一个）"
+  fi
+}
+
+cmd_ip() {
+  is_running || die "mihomo 未运行（先 proxy on）"
+  local st country city isp ip
+  IFS=$'\t' read -r st country city isp ip <<<"$(egress_info)" || true
+  [[ "${st:-}" == "success" ]] || die "出口 IP 查询失败（节点不通？）"
+  printf '节点  %s\n' "$(selected_chain)"
+  printf 'IP    %s%s%s\n' "$B" "$ip" "$RST"
+  printf '位置  %s / %s\n' "$country" "$city"
+  printf 'ISP   %s\n' "$isp"
+}
+
+cmd_update() {
+  [[ -f "$SUBFILE" ]] ||
+    die "找不到订阅文件 $SUBFILE（设 PROXY_SUB_FILE=<路径>，或用 install.sh --sub-file <路径>）"
+  local url tmp code raw backup keep_bind keep_secret over
+  url="$(grep -m1 -oE 'https://[^[:space:]]+' "$SUBFILE" || true)"
+  [[ -n "$url" ]] || die "$SUBFILE 里没有 https 链接"
+  case "$url" in *\?*) url="${url}&flag=clash" ;; *) url="${url}?flag=clash" ;; esac
+
+  # 订阅内容能改路由 = 能改变全部流量的走向，所以默认必须校验证书；
+  # 自签证书的私人机场请显式设 PROXY_SUB_INSECURE=1。
+  local -a tls=(-fsSL)
+  if [[ "$INSECURE_SUB" == "1" ]]; then
+    warn "! PROXY_SUB_INSECURE=1：订阅的 TLS 校验已关闭（仅限自签证书）"
+    tls=(-kfsSL)
+  fi
+
+  tmp="$(mktemp)"; TMPF="$tmp"
+  msg "${DIM}拉取订阅 (flag=clash)…${RST}"
+  code="$(curl "${tls[@]}" --max-time 30 -o "$tmp" -w '%{http_code}' "$url" 2>/dev/null)"
+  [[ "$code" == "200" ]] ||
+    die "订阅返回 HTTP ${code:-?}（证书不对？自签证书才设 PROXY_SUB_INSECURE=1）"
+  grep -qE '^proxies:' "$tmp" || die "订阅不是 Clash 格式：$(head -c 60 "$tmp" | tr -d '\n')"
+
+  raw="$(grep -cE '^    - \{ name:' "$tmp" || true)"
+  backup="${CONF}.bak.$(date +%Y%m%d-%H%M%S)"
+  cp "$CONF" "$backup"
+
+  # 实例级配置以本机为准：订阅一般不带 secret，直接覆盖等于把 controller 裸奔；
+  # 端口/绑定同理，否则 --port 选的端口会因为一次 update 而失效。
+  keep_bind="$(cfg_get bind-address '127.0.0.1')"
+  keep_secret="$(cfg_get secret '')"
+  { printf 'mixed-port: %s\n' "$PORT"
+    printf 'bind-address: %s\n' "$keep_bind"
+    printf 'allow-lan: false\n'
+    printf 'external-controller: %s\n' "$CTRLA"
+    [[ -n "$keep_secret" ]] && printf 'secret: %s\n' "$keep_secret"
+    grep -vE '^(mixed-port|bind-address|allow-lan|external-controller|secret):' "$tmp"
+  } > "$CONF"
+  chmod 0600 "$CONF"
+
+  over="$(grep -cE '^(tun|dns|sniffer|external-ui):' "$tmp" || true)"
+  if ((over)); then
+    warn "! 订阅里带了 ${over} 个实例级键（tun / dns / external-ui），这几项以订阅为准"
+  fi
+
+  if ! "$BIN" -t -d "$DIR" >/dev/null 2>&1; then
+    warn "! 新配置校验失败，回滚到 $(basename "$backup")"
+    "$BIN" -t -d "$DIR" 2>&1 | tail -5 >&2
+    cp "$backup" "$CONF"
+    return 1
+  fi
+  printf '%s✔%s 配置已更新（%s 个节点），旧配置备份 %s\n' "$GRN" "$RST" "${raw:-?}" "$(basename "$backup")"
+  if is_running; then
+    "$CTL" stop >/dev/null 2>&1
+    start_daemon || die "重启失败，看 proxy log"
+  fi
+}
+
+cmd_log() { tail -n "${1:-30}" "$LOG" 2>/dev/null || die "没有日志 $LOG"; }
+
+cmd_help() {
+  awk 'NR>1 { if (/^#/) { sub(/^# ?/, ""); print; next } else exit }' "$0"
+  printf '\n%s运行期变量（当前值）：%s\n' "$DIM" "$RST"
+  printf '  MIHOMO_DIR=%s\n' "$DIR"
+  printf '  PROXY_MAIN_GROUP=%s  PROXY_AUTO_GROUP=%s\n' "$MAIN_GROUP" "${AUTO_GROUP:-<自动探测 url-test 组>}"
+  printf '  PROXY_SUB_FILE=%s  PROXY_SUB_INSECURE=%s\n' "$SUBFILE" "$INSECURE_SUB"
+  printf '  PROXY_NO_PROXY=<额外直连域名>  PROXY_NO_CN_MIRRORS=0（不绕过国内镜像）\n'
+  printf '  PROXY_PICK_CANDIDATES=3（候选数） PROXY_PICK_GOOD_SPEED=4194304（够快就停） PROBE_SECS=3\n'
+}
+
+# ------------------------------------------------------------------- main -----
+
+case "${1:-status}" in
+  on)        shift; cmd_on "$@" ;;
+  off)       shift; cmd_off "$@" ;;
+  toggle)    shift; cmd_toggle "$@" ;;
+  status|st) shift; cmd_status "$@" ;;
+  pick|best) shift; cmd_pick "$@" ;;
+  nodes|ls)  shift; cmd_nodes "$@" ;;
+  node)      shift; cmd_node "$@" ;;
+  test|speed) shift; cmd_test "$@" ;;
+  ip)        shift; cmd_ip "$@" ;;
+  update|sub) shift; cmd_update "$@" ;;
+  log)       shift; cmd_log "$@" ;;
+  env)       emit_env ;;
+  help|-h|--help) cmd_help ;;
+  *) die "未知命令: $1（proxy help）" ;;
+esac
